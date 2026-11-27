@@ -224,4 +224,25 @@ Write-Host ''
 
 $playScript = Join-Path $PSScriptRoot 'play.ps1'
 & $playScript -Exe $resolvedExe -SeriesSReplica *>&1 | Write-LogLine -Path $LogFile
-exit $LASTEXITCODE
+$rc = $LASTEXITCODE
+
+if ($rc -ne 0) {
+    $dataRoot = Get-TomlPathSetting -Key 'data_dir' -DefaultValue (Join-Path $env:LOCALAPPDATA 'victory\data')
+    if (Test-Path $dataRoot -PathType Container) {
+        $latestCrash = Get-ChildItem -Path $dataRoot -Filter 'crashes.log' -Recurse -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+        if ($latestCrash) {
+            Write-Host ''
+            Write-Host "=== Latest crash log ($($latestCrash.FullName)) ===" -ForegroundColor Yellow
+            Get-Content $latestCrash.FullName -Tail 35 | Write-LogLine -Path $LogFile
+        }
+    }
+    Write-Host ''
+    $retry = (Read-Host "Game exited with code $rc. Retry now in Safe Mode (-Safe)? [Y/n]").Trim()
+    if ([string]::IsNullOrEmpty($retry) -or $retry -match '^[Yy]') {
+        Write-Host '[*] Retrying in Safe Mode (-SeriesSReplica -Safe)...' -ForegroundColor Cyan
+        & $playScript -Exe $resolvedExe -SeriesSReplica -Safe *>&1 | Write-LogLine -Path $LogFile
+        $rc = $LASTEXITCODE
+    }
+}
+exit $rc

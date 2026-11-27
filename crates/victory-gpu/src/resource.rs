@@ -1250,7 +1250,9 @@ struct Hosted {
 #[cfg(windows)]
 pub(crate) fn held_only() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HELD_LEVELS").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_HELD_LEVELS").is_none_or(|v| v != "0") && !crate::tiles::wanted()
+    })
 }
 
 /// The first level a placed texture's view shows: of views of one 2D
@@ -1652,13 +1654,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             && r.desc.depth_or_array_size == 1
             && r.desc.mip_levels > 1
             && r.desc.sample_count <= 1;
-        let cap_skip = over_cap(&r.desc);
-        let low_vram_capped = cap_skip > 0
-            && video_memory_percent() >= 80
-            && crate::host::host()
-                .and_then(|h| h.video_memory())
-                .is_some_and(|[b, ..]| b <= (8 << 30));
-        if shape_fits && r.host.placed.load(Relaxed) && !low_vram_capped && crate::tiles::wanted() {
+        if shape_fits && r.host.placed.load(Relaxed) && crate::tiles::wanted() {
             let bytes = footprint(&r.desc).map_or(0, |f| f.size);
             let start = r.data() as u64;
             // What the upload can read: a console layout, no XOR mode

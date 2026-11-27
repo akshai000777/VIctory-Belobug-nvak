@@ -276,228 +276,37 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
 /// is asked (its dispatch counts are 32 bits), and so does an AMD card, whose
 /// dispatch packets and group numbers are the same; D3D12 does not look at
 /// indirect counts. Other cards stay at 65,535.
-fn widest(wide: bool) -> u32 {
+fn widest(amd: bool) -> u32 {
     let on = std::env::var_os("VICTORY_INDIRECT_WIDE").is_none_or(|v| v != "0");
-    if wide && on { 1 << 20 } else { 65_535 }
+    if amd && on { 1 << 20 } else { 65_535 }
 }
 
-/// DXGI PCI vendor ID of `device`'s adapter (`0x1002` AMD, `0x10DE` NVIDIA,
-/// `0x8086` Intel).
-fn vendor_id(device: &ID3D12Device) -> Option<u32> {
-    use windows::Win32::Graphics::Dxgi::{
-        CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4,
-    };
+/// Whether `device` is an AMD card's.
+pub(crate) fn amd(device: &ID3D12Device) -> bool {
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4};
     // SAFETY: plain queries.
     unsafe {
         CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid()))
             .and_then(|a| a.GetDesc1())
-            .ok()
-            .map(|d| d.VendorId)
-    }
-}
-
-/// Whether `device` is an AMD card's.
-pub(crate) fn amd(device: &ID3D12Device) -> bool {
-    vendor_id(device) == Some(0x1002)
-}
-
-/// Whether `device` executes `ExecuteIndirect` `Dispatch` X group counts
-/// above 65,535 cleanly (115,200+ tiles in the title's 8x4 tile lists):
-/// native on AMD; probed once per adapter LUID on NVIDIA; off on other
-/// vendors/WARP unless `VICTORY_INDIRECT_WIDE=1` overrides.
-fn wide_indirect(device: &ID3D12Device) -> bool {
-    if let Some(v) = std::env::var_os("VICTORY_INDIRECT_WIDE") {
-        return v != "0";
-    }
-    let Some(vendor) = vendor_id(device) else {
-        return false;
-    };
-    if vendor == 0x1002 {
-        return true;
-    }
-    if vendor != 0x10DE {
-        return false;
-    }
-    // SAFETY: plain query.
-    let luid = unsafe { device.GetAdapterLuid() };
-    let key = (u64::from(luid.LowPart)) | ((u64::from(luid.HighPart as u32)) << 32);
-    static PROBED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u64, bool>>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    if let Some(&cached) = PROBED.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
-        return cached;
-    }
-    let ok = probe_wide_indirect(device).unwrap_or(false);
-    tracing::info!(
-        vendor = format_args!("{vendor:#06x}"),
-        wide_indirect = ok,
-        "probed >65535 ExecuteIndirect dispatch X support"
-    );
-    PROBED.lock().unwrap_or_else(|e| e.into_inner()).insert(key, ok);
-    ok
-}
-
-fn probe_wide_indirect(device: &ID3D12Device) -> windows::core::Result<bool> {
-    use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
-    const TEST_GROUPS: u32 = 65_536;
-    const PROBE_CS: &str = r#"
-#define RS "UAV(u0)"
-RWByteAddressBuffer counter : register(u0);
-[RootSignature(RS)]
-[numthreads(1, 1, 1)]
-void main() {
-    uint old;
-    counter.InterlockedAdd(0, 1, old);
-}
-"#;
-    let mut code: Option<ID3DBlob> = None;
-    // SAFETY: static HLSL source string.
-    unsafe {
-        D3DCompile(
-            PROBE_CS.as_ptr().cast(),
-            PROBE_CS.len(),
-            s!("wide_probe"),
-            None,
-            None,
-            s!("main"),
-            s!("cs_5_1"),
-            0,
-            0,
-            &mut code,
-            None,
-        )?;
-    }
-    let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: self-contained temporary D3D12 objects created and waited on before returning.
-    unsafe {
-        let bytes =
-            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
-        let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-            pRootSignature: std::mem::transmute_copy(&root),
-            CS: D3D12_SHADER_BYTECODE {
-                pShaderBytecode: bytes.as_ptr().cast(),
-                BytecodeLength: bytes.len(),
-            },
-            ..Default::default()
-        })?;
-        let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-            Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-            ..Default::default()
-        })?;
-        let allocator: ID3D12CommandAllocator =
-            device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-        let list: ID3D12GraphicsCommandList =
-            device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, Some(&pso))?;
-        let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
-        let buf_desc = |size, flags, state: D3D12_HEAP_TYPE| {
-            let mut out: Option<ID3D12Resource> = None;
-            let heap = D3D12_HEAP_PROPERTIES {
-                Type: state,
-                ..Default::default()
-            };
-            let res = D3D12_RESOURCE_DESC {
-                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                Width: size,
-                Height: 1,
-                DepthOrArraySize: 1,
-                MipLevels: 1,
-                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                Flags: flags,
-                ..Default::default()
-            };
-            let initial = match state {
-                D3D12_HEAP_TYPE_UPLOAD => D3D12_RESOURCE_STATE_GENERIC_READ,
-                D3D12_HEAP_TYPE_READBACK => D3D12_RESOURCE_STATE_COPY_DEST,
-                _ => D3D12_RESOURCE_STATE_COMMON,
-            };
-            device
-                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &res, initial, None, &mut out)
-                .map(|()| out.unwrap())
-        };
-        let uav = buf_desc(256, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_HEAP_TYPE_DEFAULT)?;
-        let upload = buf_desc(256, D3D12_RESOURCE_FLAG_NONE, D3D12_HEAP_TYPE_UPLOAD)?;
-        let readback = buf_desc(256, D3D12_RESOURCE_FLAG_NONE, D3D12_HEAP_TYPE_READBACK)?;
-        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-        upload.Map(0, None, Some(&raw mut ptr))?;
-        std::ptr::write_bytes(ptr, 0, 256);
-        ptr.cast::<[u32; 3]>().write([TEST_GROUPS, 1, 1]);
-        upload.Unmap(0, None);
-        let arg = D3D12_INDIRECT_ARGUMENT_DESC {
-            Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
-            ..Default::default()
-        };
-        let sig_desc = D3D12_COMMAND_SIGNATURE_DESC {
-            ByteStride: 12,
-            NumArgumentDescs: 1,
-            pArgumentDescs: &arg,
-            NodeMask: 0,
-        };
-        let mut sig: Option<ID3D12CommandSignature> = None;
-        device.CreateCommandSignature(&sig_desc, None::<&ID3D12RootSignature>, &mut sig)?;
-        let sig = sig.unwrap();
-
-        list.CopyBufferRegion(&uav, 0, &upload, 128, 4);
-        list.ResourceBarrier(&[transition(
-            &uav,
-            D3D12_RESOURCE_STATE_COPY_DEST,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        )]);
-        list.SetComputeRootSignature(&root);
-        list.SetComputeRootUnorderedAccessView(0, uav.GetGPUVirtualAddress());
-        list.ExecuteIndirect(&sig, 1, &upload, 0, None::<&ID3D12Resource>, 0);
-        list.ResourceBarrier(&[transition(
-            &uav,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_COPY_SOURCE,
-        )]);
-        list.CopyBufferRegion(&readback, 0, &uav, 0, 4);
-        list.Close()?;
-
-        let raw: Option<ID3D12CommandList> = Some(list.into());
-        queue.ExecuteCommandLists(&[raw]);
-        queue.Signal(&fence, 1)?;
-        if fence.GetCompletedValue() < 1 {
-            let event = CreateEventW(None, false, false, None)?;
-            let waited = fence.SetEventOnCompletion(1, event);
-            if waited.is_ok() {
-                WaitForSingleObject(event, INFINITE);
-            }
-            let _ = CloseHandle(event);
-            waited?;
-        }
-
-        let mut out_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-        readback.Map(0, None, Some(&raw mut out_ptr))?;
-        let count = out_ptr.cast::<u32>().read_volatile();
-        readback.Unmap(0, None);
-        Ok(count == TEST_GROUPS)
+            .is_ok_and(|d| d.VendorId == 0x1002)
     }
 }
 
 /// Whether a record that does not fit in what is left of its list's budget
 /// takes the rest, so that every record after it runs empty too
-/// (`VICTORY_INDIRECT_REST=1`: takes the rest; default `0`: it takes nothing,
-/// and the next one that fits runs so one oversized garbage record does not
-/// drop later valid draws). The frame line says how many records a frame are
-/// refused.
+/// (`VICTORY_INDIRECT_REST=0`: it takes nothing, and the next one that fits
+/// runs). A list whose budget one garbage record empties loses all its later
+/// draws, and which record that is may differ from frame to frame. The frame
+/// line says how many records a frame are refused.
 fn rest() -> u32 {
-    u32::from(std::env::var("VICTORY_INDIRECT_REST").is_ok_and(|v| v == "1"))
+    u32::from(std::env::var("VICTORY_INDIRECT_REST").map_or(true, |v| v != "0"))
 }
 
 /// The clamp compiled from `source` (ours, or in the benchmark the one it
 /// replaced).
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
-    let source = &format!(
-        "#define WIDEST {}u\n#define REST {}\n{source}",
-        widest(wide_indirect(device)),
-        rest()
-    );
+    let source = &format!("#define WIDEST {}u\n#define REST {}\n{source}", widest(amd(device)), rest());
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -2796,7 +2605,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
     /// left then, and the records as clamped.
     fn four_records_of_a_group(rest: bool) -> Option<(u32, Vec<u32>)> {
         let mut warp = WarpHarness::new()?;
-        let source = SOURCE.replace("REST ?", if rest { "true ?" } else { "false ?" });
+        let source = if rest { SOURCE.to_owned() } else { SOURCE.replace("REST ?", "false ?") };
         let clamp = make_from(&warp.device, &source).expect("the clamp must compile on WARP");
         const KIND_DRAW: u32 = 0;
         const STRIDE: u32 = 16;
@@ -3170,7 +2979,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
         let Some(mut gpu) = WarpHarness::on(false) else {
             return;
         };
-        if !wide_indirect(&gpu.device) || widest(true) == 65_535 {
+        if !amd(&gpu.device) || widest(true) == 65_535 {
             return;
         }
         let worker = compile_cs(&gpu.device, CS).expect("the worker must compile");
@@ -3383,12 +3192,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
             };
             assert_eq!(out.iter().filter(|&&v| v == 1 << 22).count(), filled, "{times} times {records}: {out:?}");
             assert!(out.iter().all(|&v| v == 0 || v == 1 << 22));
-            let expected_spent = if filled == 0 && rest() == 0 {
-                0
-            } else {
-                BUDGET.min((1 << 26) * times * records as u32)
-            };
-            assert_eq!(spent, expected_spent);
+            assert_eq!(spent, BUDGET.min((1 << 26) * times * records as u32));
         }
     }
 

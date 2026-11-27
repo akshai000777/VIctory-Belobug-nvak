@@ -118,7 +118,7 @@ For NVIDIA DLSS Super Resolution (`-Dlss quality`, works at `1920x1080`,
 is discovered automatically from the active NVIDIA adapter's driver store.
 For modest 6 GB / 16 GB PCs, `scripts\play.ps1 -Exe <path> -LowSpec -Dlss quality -Output 1920x1080`
 (or `-Fsr quality`) activates aggressive residency (`VICTORY_RESIDENCY`),
-on-demand mip streaming (`VICTORY_LEVELS_ON_DEMAND`), bounded command-allocator
+texture mip capping (`VICTORY_TEXTURE_MAX`), bounded command-allocator
 lists (`VICTORY_LIST_POOL_MAX`), and 1080p render targets.
 
 For PC FSR 4.1.2, set `[paths].fidelityfx_dir` in `victory.toml` or
