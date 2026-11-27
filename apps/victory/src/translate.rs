@@ -428,6 +428,15 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>, list: Option<PathBuf
     for root in &paths {
         for (path, data) in scan.files(root) {
             let jobs = sources(&data);
+            if !jobs.is_empty() {
+                let name = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
+                println!("translating {} shader containers in {name}...", jobs.len());
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+            } else if data.len() >= (64 << 20) {
+                let name = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
+                println!("scanned {name} ({} MiB, 0 shaders)...", data.len() >> 20);
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+            }
             let next = AtomicUsize::new(0);
             std::thread::scope(|s| {
                 for _ in 0..threads.min(jobs.len()) {
@@ -441,8 +450,9 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>, list: Option<PathBuf
                             match victory_hle::modules::d3d12x::precompile(&bytes) {
                                 Ok(_) => {
                                     let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-                                    if n.is_multiple_of(1000) {
+                                    if n == 50 || n == 200 || n.is_multiple_of(500) {
                                         println!("{n} shaders in the cache, {:.0} s", started.elapsed().as_secs_f64());
+                                        let _ = std::io::Write::flush(&mut std::io::stdout());
                                     }
                                 }
                                 Err(why) => {

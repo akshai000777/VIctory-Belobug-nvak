@@ -17,6 +17,15 @@ $LogDir = Join-Path $env:LOCALAPPDATA 'victory\logs'
 $LogFile = Join-Path $LogDir 'series-s-last.log'
 $ShaderMarker = Join-Path $LogDir 'shaders-done.txt'
 New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+[System.IO.File]::WriteAllText($LogFile, '', (New-Object System.Text.UTF8Encoding($false)))
+
+filter Write-LogLine {
+    param([string]$Path)
+    $msg = if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message } else { "$_" }
+    Write-Host $msg
+    $clean = $msg -replace '\x1b\[[0-9;]*[A-Za-z]', ''
+    Add-Content -Path $Path -Value $clean -Encoding UTF8
+}
 
 function Get-TomlPathSetting {
     param([string]$Key, [string]$DefaultValue)
@@ -155,11 +164,11 @@ function Invoke-ShaderPrecompile {
     param([string]$VictoryExe, [string]$GameDir)
     Write-Host ''
     Write-Host '[Step 3/4] Pre-translating shaders for NVIDIA RTX 3050 (one-time per game)...' -ForegroundColor Cyan
-    Write-Host '          This prevents audio-only / frozen UI stalls on boot.' -ForegroundColor Gray
+    Write-Host '          Do not close while scanning/translating — progress lines print live below.' -ForegroundColor Gray
     $prevAdapter = $env:VICTORY_D3D12_ADAPTER
     $env:VICTORY_D3D12_ADAPTER = 'NVIDIA'
     try {
-        & $VictoryExe shaders $GameDir 2>&1 | Tee-Object -FilePath $LogFile
+        & $VictoryExe shaders $GameDir 2>&1 | Write-LogLine -Path $LogFile
         if ($LASTEXITCODE -eq 0) {
             Mark-ShadersDone -GameDir $GameDir
         } else {
@@ -214,5 +223,5 @@ Write-Host '--------------------------------------------------------------------
 Write-Host ''
 
 $playScript = Join-Path $PSScriptRoot 'play.ps1'
-& $playScript -Exe $resolvedExe -SeriesSReplica *>&1 | Tee-Object -FilePath $LogFile
+& $playScript -Exe $resolvedExe -SeriesSReplica *>&1 | Write-LogLine -Path $LogFile
 exit $LASTEXITCODE
