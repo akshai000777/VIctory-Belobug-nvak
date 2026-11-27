@@ -1,8 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "apps/*", "xtask"]
-# Fixtures are standalone crates built on demand by integration tests.
-exclude = ["tests/fixtures"]
+# Fixtures and standalone DLL targets are built on demand outside the main lockfile.
+exclude = ["tests/fixtures", "dlls"]
 
 [workspace.package]
 version = "0.1.0"

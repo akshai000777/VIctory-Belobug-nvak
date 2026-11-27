@@ -27,6 +27,49 @@ pub use victory_gpu::console;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use victory_gpu::replay;
 
+/// Looks up an implemented console API export by DLL name and symbol name
+/// (`#n` for an ordinal).
+pub fn lookup_export(dll: &str, name: &str) -> Option<usize> {
+    registry::lookup(dll, name)
+}
+
+/// Ensures standalone HLE DLLs know the host process's main executable and
+/// optional `VICTORY_CACHE_DIR` shader cache when loaded outside `victory.exe`.
+#[cfg(windows)]
+pub fn ensure_standalone_host_init() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        if runtime::main_image().is_none() {
+            // SAFETY: `GetModuleHandleW(NULL)` returns the current process EXE module base.
+            let base = unsafe {
+                windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null())
+            } as usize;
+            if base != 0 {
+                runtime::set_main_image(base);
+                let mut buf = vec![0u16; 32768];
+                // SAFETY: `buf` is a writable buffer of `buf.len()` UTF-16 code units.
+                let len = unsafe {
+                    windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW(
+                        base as _,
+                        buf.as_mut_ptr(),
+                        buf.len() as u32,
+                    )
+                } as usize;
+                if len > 0 && len < buf.len() {
+                    use std::os::windows::ffi::OsStringExt;
+                    let path =
+                        std::path::PathBuf::from(std::ffi::OsString::from_wide(&buf[..len]));
+                    runtime::set_image_path(base, &path);
+                }
+            }
+        }
+        if let Some(cache) = std::env::var_os("VICTORY_CACHE_DIR").filter(|v| !v.is_empty()) {
+            modules::d3d12x::use_shader_cache(std::path::PathBuf::from(cache).join("shaders"));
+        }
+    });
+}
+
 #[cfg(windows)]
 pub use victory_gpu::pipeline::known as known_pipelines;
 /// Renderer port #2's switch and marks, for the launcher.
@@ -158,5 +201,59 @@ mod tests {
         }
         // A call we do not implement is not passed to the host either.
         assert_eq!(r.classify("rpcrt4.dll", &name("RpcServerRegisterIf")), None);
+    }
+
+    #[test]
+    fn standalone_dll_exports_are_all_registered() {
+        for sym in [
+            "D3D12ConfigureVirtualMemoryX",
+            "D3D12XboxCreateDevice",
+            "D3D12SerializeRootSignature",
+            "D3D12SerializeVersionedRootSignature",
+            "D3D12CreateRootSignatureDeserializer",
+            "IID_ID3D12Device",
+        ] {
+            assert!(lookup_export("d3d12_xs.dll", sym).is_some(), "d3d12_xs.dll!{sym}");
+        }
+        let iid_ptr = lookup_export("d3d12_xs.dll", "IID_ID3D12Device").unwrap() as *const [u8; 16];
+        // SAFETY: `IID_ID3D12Device` is a static 16-byte GUID in `victory_gpu::device`.
+        let iid = unsafe { *iid_ptr };
+        assert_eq!(
+            iid,
+            [
+                0xf1, 0x19, 0x98, 0x18, 0xb6, 0x1d, 0x57, 0x4b, 0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b,
+                0x85, 0xf7,
+            ]
+        );
+        for sym in [
+            "XDspConnectWithMaximumStreamLimit",
+            "XDspDisconnect",
+            "XDspActivate",
+            "XDspDeactivate",
+            "XDspSubmitCommand",
+        ] {
+            assert!(lookup_export("chad.dll", sym).is_some(), "chad.dll!{sym}");
+        }
+        for sym in ["XGCreateTextureComputer", "XGSuggestSwizzleMode"] {
+            assert!(lookup_export("xg_xs.dll", sym).is_some(), "xg_xs.dll!{sym}");
+        }
+        #[cfg(windows)]
+        for sym in [
+            "XMemAlloc",
+            "XMemFree",
+            "XMemAllocDefault",
+            "XMemFreeDefault",
+            "XMemIsToolsMemAvailable",
+            "XMemAllocatePhysicalPages",
+            "XMemFreePhysicalPages",
+            "XMemMapPhysicalPages",
+            "XMemMapPhysicalPagesScatter",
+            "XMemVirtualAlloc",
+            "XMemVirtualQuery",
+            "XMemGetWorkingSetStatistics",
+            "XMemTransferMemory",
+        ] {
+            assert!(lookup_export("xmem.dll", sym).is_some(), "xmem.dll!{sym}");
+        }
     }
 }
