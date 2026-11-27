@@ -204,7 +204,7 @@ impl Drop for CoreLib {
 
 struct NgxRuntime {
     _core: CoreLib,
-    device: ID3D12Device,
+    _device: ID3D12Device,
     dlss_dir: PathBuf,
     _dlss_path_wide: Vec<u16>,
     cap_params: usize,
@@ -578,7 +578,7 @@ pub(crate) fn init(explicit_dir: Option<&Path>) -> Result<(), String> {
 
     let runtime = NgxRuntime {
         _core: library,
-        device,
+        _device: device,
         dlss_dir: dlss_dir.clone(),
         _dlss_path_wide: dlss_path_wide,
         cap_params: cap_params as usize,

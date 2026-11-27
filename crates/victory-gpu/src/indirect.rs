@@ -322,8 +322,8 @@ fn wide_indirect(device: &ID3D12Device) -> bool {
     // SAFETY: plain query.
     let luid = unsafe { device.GetAdapterLuid() };
     let key = (u64::from(luid.LowPart)) | ((u64::from(luid.HighPart as u32)) << 32);
-    static PROBED: std::sync::Mutex<std::collections::HashMap<u64, bool>> =
-        std::sync::Mutex::new(std::collections::HashMap::new());
+    static PROBED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u64, bool>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     if let Some(&cached) = PROBED.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
         return cached;
     }
@@ -391,7 +391,6 @@ void main() {
         let list: ID3D12GraphicsCommandList =
             device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, Some(&pso))?;
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
-        let event = CreateEventW(None, false, false, None)?;
         let buf_desc = |size, flags, state: D3D12_HEAP_TYPE| {
             let mut out: Option<ID3D12Resource> = None;
             let heap = D3D12_HEAP_PROPERTIES {
@@ -451,7 +450,7 @@ void main() {
         )]);
         list.SetComputeRootSignature(&root);
         list.SetComputeRootUnorderedAccessView(0, uav.GetGPUVirtualAddress());
-        list.ExecuteIndirect(&sig, 1, &upload, 0, None, 0);
+        list.ExecuteIndirect(&sig, 1, &upload, 0, None::<&ID3D12Resource>, 0);
         list.ResourceBarrier(&[transition(
             &uav,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -464,10 +463,14 @@ void main() {
         queue.ExecuteCommandLists(&[raw]);
         queue.Signal(&fence, 1)?;
         if fence.GetCompletedValue() < 1 {
-            fence.SetEventOnCompletion(1, event)?;
-            WaitForSingleObject(event, INFINITE);
+            let event = CreateEventW(None, false, false, None)?;
+            let waited = fence.SetEventOnCompletion(1, event);
+            if waited.is_ok() {
+                WaitForSingleObject(event, INFINITE);
+            }
+            let _ = CloseHandle(event);
+            waited?;
         }
-        let _ = CloseHandle(event);
 
         let mut out_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
         readback.Map(0, None, Some(&raw mut out_ptr))?;

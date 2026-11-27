@@ -145,11 +145,11 @@ fn qai_ngx_dir(luid: (u32, i32)) -> Option<std::path::PathBuf> {
             return None;
         }
         let enum_fn = GetProcAddress(gdi, c"D3DKMTEnumAdapters2".as_ptr().cast())
-            .map(|p| std::mem::transmute::<_, EnumFn>(p));
+            .map(|p| std::mem::transmute::<unsafe extern "system" fn() -> isize, EnumFn>(p));
         let query_fn = GetProcAddress(gdi, c"D3DKMTQueryAdapterInfo".as_ptr().cast())
-            .map(|p| std::mem::transmute::<_, QueryFn>(p));
+            .map(|p| std::mem::transmute::<unsafe extern "system" fn() -> isize, QueryFn>(p));
         let close_fn = GetProcAddress(gdi, c"D3DKMTCloseAdapter".as_ptr().cast())
-            .map(|p| std::mem::transmute::<_, CloseFn>(p));
+            .map(|p| std::mem::transmute::<unsafe extern "system" fn() -> isize, CloseFn>(p));
         let (Some(enum_fn), Some(query_fn), Some(close_fn)) = (enum_fn, query_fn, close_fn) else {
             let _ = FreeLibrary(gdi);
             return None;
@@ -250,7 +250,7 @@ fn registry_ngx_dir() -> Option<std::path::PathBuf> {
         let res = RegQueryValueExW(
             key,
             val.as_ptr(),
-            std::ptr::null_mut(),
+            std::ptr::null(),
             &raw mut kind,
             buf.as_mut_ptr().cast(),
             &raw mut bytes,
