@@ -1952,6 +1952,22 @@ pub struct WorkingSet {
     pub kernel_pool_limit: u32,
 }
 
+fn working_set_commit_floor(title_limit: usize, commit_headroom: Option<u64>) -> Option<(u64, u64)> {
+    const SOFT_HEADROOM: u64 = 3072 * (1 << 20);
+    const CRIT_HEADROOM: u64 = 512 * (1 << 20);
+    let headroom = commit_headroom.filter(|&h| h < SOFT_HEADROOM)?;
+    // Smoothly raise reported unified-memory usage (86%..97%) only as actual OS
+    // commit headroom tightens so the title's own streamer releases old pages
+    // before Windows hits ERROR_COMMITMENT_LIMIT. Physical free RAM caching alone
+    // must not arm this floor while pagefile commit headroom remains healthy.
+    let span = SOFT_HEADROOM - CRIT_HEADROOM;
+    let t = (SOFT_HEADROOM - headroom.max(CRIT_HEADROOM)) * 11 / span;
+    let pct = 86 + t;
+    let floor = ((title_limit as u64).saturating_mul(pct) / 100)
+        .min((title_limit as u64).saturating_sub(64 * MIB as u64));
+    Some((floor, pct))
+}
+
 /// The title's budget and our process's commit as what it uses. No tools
 /// memory: a retail console.
 // shortcut: all fields are filled whatever the flags ask for, and use is
@@ -1975,20 +1991,30 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
         .saturating_sub(host_overhead)
         .max((raw_commit / 8).min((title_limit / 2) as u64))
         .max(u64::from(raw_commit > 0));
-    if let Some(headroom) = victory_gpu::external::pc_memory_headroom() {
-        const SOFT_HEADROOM: u64 = 3072 * (1 << 20);
-        const CRIT_HEADROOM: u64 = 512 * (1 << 20);
-        if headroom < SOFT_HEADROOM {
-            // Smoothly raise reported unified-memory usage (86%..97%) as OS
-            // headroom tightens so the title's own streamer releases old pages
-            // before Windows hits ERROR_COMMITMENT_LIMIT.
-            let span = SOFT_HEADROOM - CRIT_HEADROOM;
-            let t = (SOFT_HEADROOM - headroom.max(CRIT_HEADROOM)) * 11 / span;
-            let pct = 86 + t;
-            let floor = ((title_limit as u64).saturating_mul(pct) / 100)
-                .min((title_limit as u64).saturating_sub(64 * MIB as u64));
-            adjusted = adjusted.max(floor);
+    let commit_headroom = victory_gpu::external::pc_commit_headroom();
+    static LAST_FLOOR_PCT: AtomicU64 = AtomicU64::new(0);
+    match working_set_commit_floor(title_limit, commit_headroom) {
+        Some((floor, pct)) if floor > adjusted => {
+            adjusted = floor;
+            if LAST_FLOOR_PCT.swap(pct, Ordering::Relaxed) != pct {
+                tracing::warn!(
+                    commit_headroom_mb = commit_headroom.unwrap_or(0) >> 20,
+                    floor_pct = pct,
+                    limit_mb = title_limit >> 20,
+                    used_mb = adjusted.min(title_limit as u64) >> 20,
+                    "XMemGetWorkingSetStatistics: clamping title_used under low OS commit headroom"
+                );
+            }
         }
+        None if LAST_FLOOR_PCT.load(Ordering::Relaxed) != 0
+            && LAST_FLOOR_PCT.swap(0, Ordering::Relaxed) != 0 =>
+        {
+            tracing::info!(
+                commit_headroom_mb = commit_headroom.unwrap_or(0) >> 20,
+                "XMemGetWorkingSetStatistics: OS commit floor cleared"
+            );
+        }
+        _ => {}
     }
     let stats = WorkingSet {
         title_limit,
@@ -2746,5 +2772,29 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn working_set_commit_floor_ignores_healthy_commit_and_clamps_under_pressure() {
+        let limit = 7776 * MIB;
+        assert_eq!(working_set_commit_floor(limit, None), None);
+        assert_eq!(
+            working_set_commit_floor(limit, Some(43_471 * (MIB as u64))),
+            None
+        );
+        assert_eq!(
+            working_set_commit_floor(limit, Some(3072 * (MIB as u64))),
+            None
+        );
+
+        let (floor_mid, pct_mid) =
+            working_set_commit_floor(limit, Some(2231 * (MIB as u64))).expect("below 3 GiB");
+        assert_eq!(pct_mid, 89);
+        assert_eq!(floor_mid, (limit as u64 * 89) / 100);
+
+        let (floor_crit, pct_crit) =
+            working_set_commit_floor(limit, Some(128 * (MIB as u64))).expect("critical");
+        assert_eq!(pct_crit, 97);
+        assert!(floor_crit <= (limit - 64 * MIB) as u64);
     }
 }

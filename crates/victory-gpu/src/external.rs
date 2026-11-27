@@ -45,6 +45,13 @@ pub fn pc_memory_headroom() -> Option<u64> {
         .or_else(|| crate::host::ram_sample().map(|(_, _, free, commit, ..)| free.min(commit)))
 }
 
+/// Available Windows pagefile commit headroom in bytes (guards against
+/// `ERROR_COMMITMENT_LIMIT` independently of physical standby/working-set RAM).
+pub fn pc_commit_headroom() -> Option<u64> {
+    crate::residency::commit_headroom()
+        .or_else(|| crate::host::ram_sample().map(|(_, _, _, commit, ..)| commit))
+}
+
 /// Full `(x, y, width, height)` monitor bounds of the primary display in
 /// virtual desktop coordinates, for borderless fullscreen sizing.
 pub fn primary_monitor_bounds() -> Option<(i32, i32, i32, i32)> {

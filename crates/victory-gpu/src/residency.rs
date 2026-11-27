@@ -143,6 +143,7 @@ pub(crate) fn refresh() {
     let Some(status) = memory_status() else { return };
     let (physical, commit) = (status.ullAvailPhys, status.ullAvailPageFile);
     HEADROOM.store(physical.min(commit), Ordering::Relaxed);
+    AVAILABLE_COMMIT.store(commit, Ordering::Relaxed);
     let was = pressured();
     let pressure = next_pressure(was, physical, commit);
     if pressure != was {
@@ -170,6 +171,11 @@ pub(crate) fn refresh() {
 
 pub(crate) fn headroom() -> Option<u64> {
     let bytes = HEADROOM.load(Ordering::Relaxed);
+    (bytes != u64::MAX).then_some(bytes)
+}
+
+pub(crate) fn commit_headroom() -> Option<u64> {
+    let bytes = AVAILABLE_COMMIT.load(Ordering::Relaxed);
     (bytes != u64::MAX).then_some(bytes)
 }
 

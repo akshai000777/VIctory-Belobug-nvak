@@ -656,6 +656,18 @@ fn worker_count(asked: Option<usize>, processors: usize) -> usize {
     }
 }
 
+fn limited_worker_cap(total_ram: Option<u64>) -> usize {
+    const GIB: u64 = 1 << 30;
+    match total_ram {
+        // Plus SCREEN_WORKERS (2), 4 background workers (6 threads total)
+        // avoids heavy compiler RAM/CPU contention during asset loads on
+        // 16 GiB hosts while `requested_slow` + BELOW_NORMAL keeps 3D draws
+        // unstarved.
+        Some(total) if total <= 16 * GIB => 4,
+        _ => 8,
+    }
+}
+
 /// Starts the workers ([`worker_count`]) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
@@ -669,12 +681,7 @@ fn workers() -> bool {
             std::thread::available_parallelism().map_or(2, |n| n.get()),
         );
         if asked.is_none() && crate::residency::limited_host_ram() {
-            const GIB: u64 = 1 << 30;
-            let cap = match crate::residency::total_physical_ram() {
-                Some(total) if total <= 16 * GIB => 6,
-                _ => 8,
-            };
-            workers = workers.min(cap);
+            workers = workers.min(limited_worker_cap(crate::residency::total_physical_ram()));
         }
         tracing::info!(workers, "pipeline workers");
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
@@ -884,5 +891,13 @@ mod tests {
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &slow_req));
         assert!(!slow_req.was_slow.load(Ordering::Relaxed));
         assert!(queue.pop(false, 1).is_none());
+    }
+
+    #[test]
+    fn limited_host_ram_caps_16gb_pipeline_workers_at_four() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(limited_worker_cap(Some(16 * GIB)), 4);
+        assert_eq!(limited_worker_cap(Some(32 * GIB)), 8);
+        assert_eq!(limited_worker_cap(None), 8);
     }
 }
