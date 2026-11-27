@@ -2247,6 +2247,59 @@ pub(crate) fn let_go_idle() {
             crate::host::retire(host);
         }
     }
+    // On 6–8 GiB cards, also reclaim placed render targets whose title
+    // physical pages were unmapped and that have been unused for >= 30 s
+    // and 60 frames.
+    let (mut targets_went, mut targets_bytes, mut targets_first) = (0u64, 0u64, None);
+    if memory.is_some_and(|[b, ..]| b <= (8 << 30)) {
+        for &at in all.iter() {
+            // SAFETY: as above; `all` holds live `Resource`s under `TEXTURES`'s lock.
+            let r = unsafe { &*(at as *const Resource) };
+            let used = r.host.used.load(Relaxed);
+            if used == 0
+                || fills(&r.desc)
+                || !r.host.placed.load(Relaxed)
+                || !crate::host::long_ago(used, 30_000, 60)
+                || crate::texture::committed(r.data().cast_const(), 1)
+            {
+                continue;
+            }
+            let gone = {
+                let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+                let idle = made.as_ref().is_some_and(|(host, twin)| {
+                    crate::host::long_ago(r.host.used.load(Relaxed), 30_000, 60)
+                        && std::sync::Arc::strong_count(host) == 1
+                        && crate::host::references(&host.texture) == 1
+                        && twin.as_ref().is_none_or(|t| {
+                            std::sync::Arc::strong_count(&t.colour) == 1
+                                && crate::host::references(&t.colour.texture) == 1
+                                && t.plane.as_ref().is_none_or(|p| {
+                                    std::sync::Arc::strong_count(p) == 1
+                                        && crate::host::references(&p.texture) == 1
+                                })
+                                && t.through
+                                    .as_ref()
+                                    .is_none_or(|b| crate::host::references(b) == 1)
+                        })
+                });
+                if idle { made.take() } else { None }
+            };
+            if let Some((host, twin)) = gone {
+                targets_went += 1;
+                targets_bytes += host.bytes
+                    + twin.as_ref().map_or(0, |t| {
+                        t.colour.bytes + t.plane.as_ref().map_or(0, |p| p.bytes)
+                    });
+                if targets_first.is_none() {
+                    targets_first = Some(at);
+                }
+                crate::host::retire(host);
+                if let Some(twin) = twin {
+                    crate::host::retire(twin);
+                }
+            }
+        }
+    }
     SWEPT_US[0].fetch_add(1, Relaxed);
     SWEPT_US[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
     SWEPT_US[2].fetch_max(began.elapsed().as_micros() as u64, Relaxed);
@@ -2256,6 +2309,15 @@ pub(crate) fn let_go_idle() {
                 "sweep: {went} host copies of textures the title fills let go ({} KiB), each held by its title texture alone (no list, no slot); the first: title texture {:#x}",
                 bytes >> 10,
                 first.unwrap_or(0)
+            )
+        });
+    }
+    if targets_went > 0 {
+        crate::host::trail(|| {
+            format!(
+                "sweep: {targets_went} idle placed unmapped render targets let go ({} KiB), held by no list and no slot; the first: title texture {:#x}",
+                targets_bytes >> 10,
+                targets_first.unwrap_or(0)
             )
         });
     }

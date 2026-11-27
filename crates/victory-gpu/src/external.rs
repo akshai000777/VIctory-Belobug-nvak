@@ -33,6 +33,18 @@ pub fn host_commit_bytes() -> u64 {
     crate::host::host_overhead_bytes()
 }
 
+/// Immediately releases idle command-list allocators, spare scratch buffers,
+/// and retired host objects when OS commit or physical memory tightens.
+pub fn reclaim_memory() {
+    crate::host::reclaim_memory_now();
+}
+
+/// Minimum of available physical RAM and available pagefile commit on Windows.
+pub fn pc_memory_headroom() -> Option<u64> {
+    crate::residency::headroom()
+        .or_else(|| crate::host::ram_sample().map(|(_, _, free, commit, ..)| free.min(commit)))
+}
+
 /// Full `(x, y, width, height)` monitor bounds of the primary display in
 /// virtual desktop coordinates, for borderless fullscreen sizing.
 pub fn primary_monitor_bounds() -> Option<(i32, i32, i32, i32)> {

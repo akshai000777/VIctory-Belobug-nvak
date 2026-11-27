@@ -405,6 +405,9 @@ pub(crate) fn keep_freed() -> bool {
 /// when free physical RAM is low. Never returns less than 2,000 ms.
 /// With plenty of it five minutes ([`keep_freed`]).
 pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
+    if crate::residency::critical_commit() {
+        return ram_idle_for(Some(0), false);
+    }
     // (`VICTORY_RESIDENCY=1`: the smaller of free RAM and free commit.)
     let effective = match (avail_phys, crate::residency::headroom()) {
         (Some(a), Some(b)) => Some(a.min(b)),
@@ -541,10 +544,12 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
     }
 }
 
-/// Once a second, before a submission starts: lets go of what nothing
-/// names any more (copies of windows of title memory, staging buffers,
-/// host copies of textures the title fills).
-/// `VICTORY_SWEEP=0` keeps everything, as before.
+static FORCE_SWEEP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Once a second (or sooner when [`reclaim_memory_now`] flags pressure),
+/// before a submission starts: lets go of what nothing names any more
+/// (copies of windows of title memory, staging buffers, host copies of
+/// textures the title fills). `VICTORY_SWEEP=0` keeps everything, as before.
 fn sweep() {
     // The in-place probe and census, if asked for (`VICTORY_INPLACE_PROBE`).
     crate::inplace::tick();
@@ -554,8 +559,9 @@ fn sweep() {
     }
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let now = now_ms();
+    let forced = FORCE_SWEEP.swap(false, Ordering::Relaxed);
     let last = LAST.load(Ordering::Relaxed);
-    if now < last + 1000
+    if (!forced && now < last + 1000)
         || LAST
             .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
@@ -565,14 +571,45 @@ fn sweep() {
     #[cfg(feature = "diagnostics")]
     crate::book::check();
     crate::residency::refresh();
-    if crate::residency::pressured() {
+    let critical = crate::residency::critical_commit();
+    let pressured = crate::residency::pressured();
+    let tight_16gb = crate::residency::limited_host_ram()
+        && crate::residency::headroom().is_some_and(|h| h < (4 << 30));
+    if pressured || critical || tight_16gb {
         trim_spare_chunks();
+        crate::list::trim_idle(if critical { 4 } else { 8 });
     }
     crate::pool::room(host().and_then(|h| h.video_memory()));
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
+}
+
+/// Schedules an immediate memory sweep before the next submission.
+pub(crate) fn request_sweep() {
+    FORCE_SWEEP.store(true, Ordering::Relaxed);
+}
+
+/// Immediately trims idle GPU/CPU pools and flags the next submission sweep
+/// when a host allocation or title commit approaches Windows' memory limits.
+pub(crate) fn reclaim_memory_now() {
+    static LAST_RECLAIM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = coarse_ms();
+    let prev = LAST_RECLAIM.load(Ordering::Relaxed);
+    if now < prev.saturating_add(250)
+        || LAST_RECLAIM
+            .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    crate::residency::refresh();
+    crate::list::trim_idle(4);
+    trim_spare_chunks();
+    crate::pool::room(host().and_then(|h| h.video_memory()));
+    bury(FINISHED.load(Ordering::Acquire));
+    FORCE_SWEEP.store(true, Ordering::Relaxed);
 }
 
 /// The number of the newest submission begun, and of the newest of which all

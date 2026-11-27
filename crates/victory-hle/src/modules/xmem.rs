@@ -139,7 +139,7 @@ pub extern "system" fn XMemVirtualAlloc(
     }
     // SAFETY: the title's own arguments, cleaned of console bits; the
     // parameter points at `requirements`, which outlives the call.
-    let at = unsafe {
+    let mut at = unsafe {
         VirtualAlloc2(
             GetCurrentProcess(),
             base,
@@ -155,17 +155,45 @@ pub extern "system" fn XMemVirtualAlloc(
         )
     };
     if at.is_null() {
-        let error = std::io::Error::last_os_error();
-        if kind & MEM_COMMIT != 0 {
-            commit_refused(size, "virtual memory", error);
-        } else {
-            tracing::warn!(
-                size,
-                kind = format_args!("{kind:#x}"),
-                flags = format_args!("{flags:#x}"),
-                %error,
-                "XMemVirtualAlloc refused"
-            );
+        let mut error = std::io::Error::last_os_error();
+        if kind & MEM_COMMIT != 0
+            && matches!(error.raw_os_error(), Some(code) if code == ERROR_COMMITMENT_LIMIT as i32 || code == 8)
+        {
+            victory_gpu::external::reclaim_memory();
+            // SAFETY: retrying the same commit after reclaiming idle host memory.
+            at = unsafe {
+                VirtualAlloc2(
+                    GetCurrentProcess(),
+                    base,
+                    size,
+                    kind,
+                    protect,
+                    if constrained {
+                        &mut parameter
+                    } else {
+                        std::ptr::null_mut()
+                    },
+                    constrained.into(),
+                )
+            };
+            if !at.is_null() {
+                tracing::info!(size, "XMemVirtualAlloc succeeded after reclaiming idle host memory");
+            } else {
+                error = std::io::Error::last_os_error();
+            }
+        }
+        if at.is_null() {
+            if kind & MEM_COMMIT != 0 {
+                commit_refused(size, "virtual memory", error);
+            } else {
+                tracing::warn!(
+                    size,
+                    kind = format_args!("{kind:#x}"),
+                    flags = format_args!("{flags:#x}"),
+                    %error,
+                    "XMemVirtualAlloc refused"
+                );
+            }
         }
     }
     if base.is_null() {
@@ -1789,7 +1817,17 @@ fn commit(base: usize, len: usize) -> bool {
     if !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
         return true;
     }
-    commit_refused(len, "physical pages", std::io::Error::last_os_error());
+    let mut err = std::io::Error::last_os_error();
+    if matches!(err.raw_os_error(), Some(code) if code == ERROR_COMMITMENT_LIMIT as i32 || code == 8) {
+        victory_gpu::external::reclaim_memory();
+        // SAFETY: retrying the same reserved placeholder/view commit after trimming idle host caches.
+        if !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
+            tracing::info!(len, "committed physical pages after reclaiming idle host memory");
+            return true;
+        }
+        err = std::io::Error::last_os_error();
+    }
+    commit_refused(len, "physical pages", err);
     false
 }
 
@@ -1933,13 +1971,28 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
     let title_limit = gpu_optimal + standard - TRANSFERRED.load(Ordering::Relaxed);
     let host_overhead = victory_gpu::external::host_commit_bytes();
     let raw_commit = counters.PagefileUsage as u64;
-    let adjusted = raw_commit
+    let mut adjusted = raw_commit
         .saturating_sub(host_overhead)
         .max((raw_commit / 8).min((title_limit / 2) as u64))
         .max(u64::from(raw_commit > 0));
+    if let Some(headroom) = victory_gpu::external::pc_memory_headroom() {
+        const SOFT_HEADROOM: u64 = 3072 * (1 << 20);
+        const CRIT_HEADROOM: u64 = 512 * (1 << 20);
+        if headroom < SOFT_HEADROOM {
+            // Smoothly raise reported unified-memory usage (86%..97%) as OS
+            // headroom tightens so the title's own streamer releases old pages
+            // before Windows hits ERROR_COMMITMENT_LIMIT.
+            let span = SOFT_HEADROOM - CRIT_HEADROOM;
+            let t = (SOFT_HEADROOM - headroom.max(CRIT_HEADROOM)) * 11 / span;
+            let pct = 86 + t;
+            let floor = ((title_limit as u64).saturating_mul(pct) / 100)
+                .min((title_limit as u64).saturating_sub(64 * MIB as u64));
+            adjusted = adjusted.max(floor);
+        }
+    }
     let stats = WorkingSet {
         title_limit,
-        title_used: adjusted as usize,
+        title_used: adjusted.min(title_limit as u64) as usize,
         gpu_optimal_limit: gpu_optimal,
         ..Default::default()
     };

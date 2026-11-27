@@ -45,6 +45,7 @@ static RETRY_UPLOAD_AT: AtomicU64 = AtomicU64::new(0);
 pub(crate) fn allocation_error(error: &windows::core::Error) {
     if error.code() == windows::Win32::Foundation::E_OUTOFMEMORY {
         RETRY_UPLOAD_AT.fetch_max(crate::host::coarse_ms().saturating_add(500), Ordering::Relaxed);
+        crate::host::request_sweep();
     }
 }
 
