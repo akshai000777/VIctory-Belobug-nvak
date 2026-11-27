@@ -1,5 +1,6 @@
 # Starts the title with the settings this fork is played with (README.md, "How to run it").
 #   scripts\play.ps1 -Exe <path of your own copy's executable>
+# -Console          series-x (default) or series-s (lighter 1080p / 7.6 GiB console profile)
 # -Safe             without the newer, faster ways (the first thing to try when something is wrong)
 # -RayTracing       the title's own ray-traced indirect light: lit interiors, about a third slower
 # -Fsr4K            PC FidelityFX at 3840x2160 (quality, balanced or performance): FSR 4.1.2 where AMD's SDK offers it for the card, FSR 3.1 otherwise
@@ -15,6 +16,7 @@
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
     [Parameter(Mandatory)][string]$Exe,
+    [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x',
     [switch]$Safe,
     [switch]$RayTracing,
     [ValidateSet('quality', 'balanced', 'performance')][string]$Fsr4K,
@@ -75,4 +77,4 @@ if ($discarded) {
 }
 $Exe = (Resolve-Path $Exe).Path
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
-try { & $victory run $Exe --execute } finally { Pop-Location }
+try { & $victory run $Exe --execute --console $Console } finally { Pop-Location }
