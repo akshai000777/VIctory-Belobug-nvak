@@ -650,12 +650,21 @@ fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = worker_count(
-            std::env::var("VICTORY_PIPELINE_WORKERS")
-                .ok()
-                .and_then(|v| v.trim().parse().ok()),
+        let asked = std::env::var("VICTORY_PIPELINE_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok());
+        let mut workers = worker_count(
+            asked,
             std::thread::available_parallelism().map_or(2, |n| n.get()),
         );
+        if asked.is_none() && crate::residency::limited_host_ram() {
+            const GIB: u64 = 1 << 30;
+            let cap = match crate::residency::total_physical_ram() {
+                Some(total) if total <= 16 * GIB => 4,
+                _ => 6,
+            };
+            workers = workers.min(cap);
+        }
         tracing::info!(workers, "pipeline workers");
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
         guard_start();

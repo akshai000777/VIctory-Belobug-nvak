@@ -273,6 +273,8 @@ fn show_config() -> Result<()> {
             .map_or("(none)".into(), |p| p.display().to_string())
     );
     println!("game_dir    : {}", status(&cfg.game_dir));
+    println!("fidelityfx  : {}", status(&cfg.fidelityfx_dir));
+    println!("dlss_dir    : {}", status(&cfg.dlss_dir));
     println!("cache_dir   : {}", cfg.cache_dir.display());
     println!("data_dir    : {}", cfg.data_dir.display());
     for t in &cfg.test_titles {
@@ -281,6 +283,8 @@ fn show_config() -> Result<()> {
     check_policy(
         cfg.game_dir
             .iter()
+            .chain(cfg.fidelityfx_dir.iter())
+            .chain(cfg.dlss_dir.iter())
             .chain(&cfg.test_titles)
             .chain([&cfg.cache_dir, &cfg.data_dir]),
     )

@@ -1250,9 +1250,7 @@ struct Hosted {
 #[cfg(windows)]
 pub(crate) fn held_only() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var_os("VICTORY_HELD_LEVELS").is_none_or(|v| v != "0") && !crate::tiles::wanted()
-    })
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HELD_LEVELS").is_none_or(|v| v != "0"))
 }
 
 /// The first level a placed texture's view shows: of views of one 2D
@@ -1296,9 +1294,8 @@ fn video_memory_percent() -> u64 {
 }
 
 /// How many of a streamed placed 2D texture's largest mips to skip so no side
-/// passes `VICTORY_TEXTURE_MAX` (0: uncapped; unset: 1024, then 512 from 92 %
-/// of the VRAM budget and 256 from 97 %, after `VIctory-vitesse` 7ada43b6).
-/// Keeps 16 GB cards from filling VRAM and stalling thousands of textures.
+/// passes `VICTORY_TEXTURE_MAX` (0: uncapped; unset: scales with VRAM budget
+/// and current usage to prevent VRAM spillover into system RAM).
 #[cfg(windows)]
 fn over_cap(desc: &ResourceDesc) -> u32 {
     static SET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
@@ -1310,10 +1307,25 @@ fn over_cap(desc: &ResourceDesc) -> u32 {
     if set == Some(0) {
         return 0;
     }
-    let max = set.unwrap_or_else(|| match video_memory_percent() {
-        0..92 => 1024,
-        92..97 => 512,
-        _ => 256,
+    const SIX_GIB: u64 = 6 << 30;
+    let pct = video_memory_percent();
+    let low_vram = crate::host::host()
+        .and_then(|h| h.video_memory())
+        .is_some_and(|[b, ..]| b <= SIX_GIB);
+    let max = set.unwrap_or_else(|| {
+        if low_vram {
+            match pct {
+                0..80 => 1024,
+                80..90 => 512,
+                _ => 256,
+            }
+        } else {
+            match pct {
+                0..92 => 1024,
+                92..97 => 512,
+                _ => 256,
+            }
+        }
     });
     let mut skip = 0u32;
     while (desc.width >> skip) > max || (u64::from(desc.height) >> skip) > max {
@@ -1442,7 +1454,7 @@ pub(crate) fn want_level(this: This, first: u32) {
         r.host.wanted.fetch_min(first, Relaxed);
         return;
     };
-    if host.base == 0 || host.base <= base_level(&r.desc, first) {
+    if host.tiled.is_some() || host.base == 0 || host.base <= base_level(&r.desc, first) {
         return;
     }
     r.host.wanted.store(first, Relaxed);
@@ -1640,7 +1652,13 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             && r.desc.depth_or_array_size == 1
             && r.desc.mip_levels > 1
             && r.desc.sample_count <= 1;
-        if shape_fits && r.host.placed.load(Relaxed) && crate::tiles::wanted() {
+        let cap_skip = over_cap(&r.desc);
+        let low_vram_capped = cap_skip > 0
+            && video_memory_percent() >= 80
+            && crate::host::host()
+                .and_then(|h| h.video_memory())
+                .is_some_and(|[b, ..]| b <= (8 << 30));
+        if shape_fits && r.host.placed.load(Relaxed) && !low_vram_capped && crate::tiles::wanted() {
             let bytes = footprint(&r.desc).map_or(0, |f| f.size);
             let start = r.data() as u64;
             // What the upload can read: a console layout, no XOR mode
@@ -1824,10 +1842,22 @@ pub(crate) fn targets_room_kept() -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let most = *MOST.get_or_init(|| {
-        std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
+        if let Some(mb) = std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
+        {
+            return mb.min(8192) << 20;
+        }
+        const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
+        match crate::host::host()
+            .and_then(|h| h.video_memory())
+            .map(|[b, ..]| b)
+        {
+            Some(b) if b <= 9 * GIB => (b * 35 / 100).clamp(1024 * MIB, 1792 * MIB),
+            Some(b) if b < 16 * GIB => 2048 * MIB,
+            _ => 3072 * MIB,
+        }
     });
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));

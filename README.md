@@ -68,7 +68,11 @@ describe which lighting paths run and the remaining rendering issues.
 |---|---|
 | `--console series-s` | The Series S profile: 1080p output, about 5 ms faster, a softer picture |
 | `VICTORY_OUTPUT=1920x1080` | The title renders to that output size itself (Series X profile; about 16 ms less card time) |
-| `VICTORY_FRAME_INTERVAL_MS=16.667` | Lets the title go above 30 fps (menus and videos reach 60; the game's clock stays right) |
+| `VICTORY_FRAME_INTERVAL_MS=16.667` | Lets the title go above 30 fps (menus and videos reach 60; the game's clock stays right); uses sub-ms spin pacing (`VICTORY_PACE_SPIN=0` disables) |
+| `VICTORY_WINDOW_MODE=borderless` | Sizes top-level windows cleanly to the primary monitor without borders or title bars (`windowed`, `borderless`, `fullscreen`); ideal for Lossless Scaling |
+| `VICTORY_ALLOW_TEARING` / `VICTORY_VSYNC` | Enables DXGI `ALLOW_TEARING` on a triple-buffered flip-discard swap chain (`=0` disables tearing; `VICTORY_VSYNC=1` locks to vblank) |
+| `VICTORY_DLSS` / `VICTORY_DLSS_PRESET` | Native NVIDIA DLSS Super Resolution (`dlaa`, `quality`, `balanced`, `performance`, `ultra_performance`) at any `-Output` resolution; `VICTORY_DLSS_PRESET` picks `J`, `K`, `L`, `M`, or `default` |
+| `VICTORY_FSR` / `VICTORY_FSR_4K` | AMD PC FidelityFX 4.1.2 / 3.1 upscaling across any `VICTORY_OUTPUT` mode (`VICTORY_FSR=quality`) or fixed 4K (`VICTORY_FSR_4K`) |
 | `VICTORY_AMBIENT_SETTLE` | How fast light settles after walking indoors (on by default, `250,3`; `0` turns it off) |
 | `VICTORY_TEXTURE_STORE=1` | Converted textures kept between runs (about 8 ms a frame for now: off) |
 | `VICTORY_KBM_GTA=1` | Optional GTA V PC-style keyboard and mouse mapping on the stand-in pad: `F2` or `` ` `` (`~`) toggles mouse-look and auto-hides the cursor while locked (`Esc`/`P`/focus loss unlocks and restores it), LMB/RMB = RT/LT, MMB/`C` = R3, `Shift` = A, `Space` = X, `R` = B, `F` = Y, `Tab` = LB, `Q` = RB, `Ctrl` = L3, `E` = D-pad Right, `V` = View. Tune with `VICTORY_MOUSE_SENS` (default `1.0`) and `VICTORY_MOUSE_INVERT_Y=1` (or pass via `scripts\play.ps1 -More @{VICTORY_KBM_GTA='1'}`) |
@@ -104,6 +108,18 @@ built with that feature, request DRED with
 
 `scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
 something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
+
+For NVIDIA DLSS Super Resolution (`-Dlss quality`, works at `1920x1080`,
+`2560x1440`, or `3840x2160`), set `[paths].dlss_dir` in `victory.toml` or
+`VICTORY_DLSS_DIR` to the folder holding `nvngx_dlss.dll` (or place
+`nvngx_dlss.dll` next to `victory.exe` or in `.\dlss`), then pass `-Dlss quality`
+(optionally paired with `-Output 1920x1080` or `-LowSpec` on 6–8 GB cards, or
+`-LosslessScaling` for borderless frame generation). Driver NGXCore (`_nvngx.dll`)
+is discovered automatically from the active NVIDIA adapter's driver store.
+For modest 6 GB / 16 GB PCs, `scripts\play.ps1 -Exe <path> -LowSpec -Dlss quality -Output 1920x1080`
+(or `-Fsr quality`) activates aggressive residency (`VICTORY_RESIDENCY`),
+on-demand mip streaming (`VICTORY_LEVELS_ON_DEMAND`), bounded command-allocator
+lists (`VICTORY_LIST_POOL_MAX`), and 1080p render targets.
 
 For PC FSR 4.1.2, set `[paths].fidelityfx_dir` in `victory.toml` or
 `VICTORY_FIDELITYFX_DIR` to the folder containing AMD's signed

@@ -17,6 +17,8 @@ pub struct Config {
     pub game_dir: Option<PathBuf>,
     /// Folder containing the PC FidelityFX upscaler for the optional FSR profile.
     pub fidelityfx_dir: Option<PathBuf>,
+    /// Folder containing NVIDIA's `nvngx_dlss.dll` for optional DLSS upscaling.
+    pub dlss_dir: Option<PathBuf>,
     /// Root for all derived data. Always outside the repository.
     pub cache_dir: PathBuf,
     /// What titles write and must keep (persistent local storage). Never
@@ -40,6 +42,7 @@ struct FileConfig {
 struct FilePaths {
     game_dir: Option<PathBuf>,
     fidelityfx_dir: Option<PathBuf>,
+    dlss_dir: Option<PathBuf>,
     cache_dir: Option<PathBuf>,
     data_dir: Option<PathBuf>,
     #[serde(default)]
@@ -97,6 +100,7 @@ impl Config {
         Ok(Config {
             game_dir: env_path("VICTORY_GAME_DIR").or(file.game_dir),
             fidelityfx_dir: env_path("VICTORY_FIDELITYFX_DIR").or(file.fidelityfx_dir),
+            dlss_dir: env_path("VICTORY_DLSS_DIR").or(file.dlss_dir),
             cache_dir,
             data_dir,
             test_titles,

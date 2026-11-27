@@ -16,10 +16,15 @@ use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORY
 
 const MIB: u64 = 1 << 20;
 
-/// `VICTORY_RESIDENCY=1`: the memory budgets of this module (off by default).
+/// `VICTORY_RESIDENCY=0` disables system-RAM residency budgets (enabled by default).
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_RESIDENCY").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RESIDENCY").is_none_or(|v| v != "0"))
+}
+
+pub(crate) fn total_physical_ram() -> Option<u64> {
+    static TOTAL: OnceLock<Option<u64>> = OnceLock::new();
+    *TOTAL.get_or_init(|| memory_status().map(|s| s.ullTotalPhys))
 }
 const GIB: u64 = 1 << 30;
 static PRESSURED: AtomicBool = AtomicBool::new(false);
@@ -142,6 +147,7 @@ pub(crate) fn refresh() {
     if pressure != was {
         PRESSURED.store(pressure, Ordering::Relaxed);
         if pressure {
+            crate::list::trim_idle(16);
             tracing::warn!(
                 pid = std::process::id(),
                 frame = crate::frame::current(),
@@ -156,6 +162,8 @@ pub(crate) fn refresh() {
         } else {
             tracing::info!(physical_free_mib = physical >> 20, available_commit_mib = commit >> 20, "host memory pressure cleared");
         }
+    } else if pressure {
+        crate::list::trim_idle(16);
     }
 }
 

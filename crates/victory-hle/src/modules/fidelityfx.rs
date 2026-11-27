@@ -46,9 +46,16 @@ const HOST_BACKEND: u64 = 2;
 const GET_VERSIONS: u64 = 4;
 const OVERRIDE_VERSION: u64 = 5;
 const GET_PROVIDER_VERSION: u64 = 6;
+const MEMORY_USAGE: u64 = 0x1_0008;
 const MEMORY_USAGE_WITH_DEVICE: u64 = 0x1_0009;
+const GET_UPSCALE_RATIO: u64 = 0x1_0002;
 const GET_RENDER_RESOLUTION: u64 = 0x1_0003;
+const GET_JITTER_PHASE_COUNT: u64 = 0x1_0004;
+const GET_JITTER_OFFSET: u64 = 0x1_0005;
 const DISPLAY_RESOLUTION_MOTION_VECTORS: u32 = 1 << 1;
+
+const DLSS_PROVIDER_ID: u64 = 0x0044_4C53_5300_0001;
+const DLSS_PROVIDER_NAME: &CStr = c"DLSS 3/4";
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -143,6 +150,50 @@ struct OverrideVersion {
     id: u64,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RatioQuery {
+    header: Header,
+    quality: u32,
+    ratio: *mut f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RenderResolutionQuery {
+    header: Header,
+    display: [u32; 2],
+    quality: u32,
+    width: *mut u32,
+    height: *mut u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct JitterPhaseCountQuery {
+    header: Header,
+    render_width: u32,
+    output_width: u32,
+    count: *mut i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct JitterOffsetQuery {
+    header: Header,
+    index: i32,
+    phases: i32,
+    x: *mut f32,
+    y: *mut f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MemoryUsageQuery {
+    header: Header,
+    usage: *mut [u64; 2],
+}
+
 type Create = unsafe extern "C" fn(*mut *mut c_void, *mut Header, *const c_void) -> u32;
 type Destroy = unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> u32;
 /// Configure, query and dispatch.
@@ -177,14 +228,23 @@ unsafe impl Send for Host {}
 // SAFETY: as above.
 unsafe impl Sync for Host {}
 
-static HOST: OnceLock<Host> = OnceLock::new();
+enum Provider {
+    FidelityFx(Host),
+    Dlss,
+}
+
+static PROVIDER: OnceLock<Provider> = OnceLock::new();
+
+enum ContextBackend {
+    FidelityFx(CreateChain),
+    Dlss(Mutex<super::dlss::DlssInstance>),
+}
+
 struct Context {
     // Serializes recording and destruction for this particular temporal history.
     live: Mutex<bool>,
     first_dispatch: std::sync::Once,
-    // The FFX API requires pointers in the creation descriptor to remain
-    // live through destroy, including our replacement backend.
-    creation: CreateChain,
+    backend: ContextBackend,
 }
 
 struct CreateChain {
@@ -232,11 +292,15 @@ macro_rules! once {
     }};
 }
 
-/// Select the PC provider before the title's import registry is initialized.
+/// Select the PC FidelityFX provider before the title's import registry is initialized.
 pub fn use_host_dir(dir: &Path) -> Result<(), String> {
+    if PROVIDER.get().is_some() {
+        return Err(String::from("Upscaler provider already initialized"));
+    }
     let (host, version) = load(dir)?;
-    HOST.set(host)
-        .map_err(|_| String::from("FidelityFX provider already initialized"))?;
+    PROVIDER
+        .set(Provider::FidelityFx(host))
+        .map_err(|_| String::from("Upscaler provider already initialized"))?;
     if !is_fsr_4_1_2(&version) {
         tracing::warn!(
             version,
@@ -247,9 +311,25 @@ pub fn use_host_dir(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether the host's FidelityFX serves the title's.
+/// Select the NVIDIA DLSS provider before the title's import registry is initialized.
+pub fn use_dlss(dir: Option<&Path>) -> Result<(), String> {
+    if PROVIDER.get().is_some() {
+        return Err(String::from("Upscaler provider already initialized"));
+    }
+    super::dlss::init(dir)?;
+    PROVIDER
+        .set(Provider::Dlss)
+        .map_err(|_| String::from("Upscaler provider already initialized"))?;
+    let resolved = super::dlss::dlss_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| String::from("auto"));
+    tracing::info!(folder = resolved, "NVIDIA DLSS: selected PC upscaler");
+    Ok(())
+}
+
+/// Whether a host upscaler serves `amd_fidelityfx_loader_xbox.dll`.
 pub fn serving() -> bool {
-    HOST.get().is_some()
+    PROVIDER.get().is_some()
 }
 
 fn load(dir: &Path) -> Result<(Host, String), String> {
@@ -417,12 +497,21 @@ fn host_state(state: u32) -> Option<u32> {
     })
 }
 
+fn dlss_input_state(state: u32) -> Option<u32> {
+    let base = host_state(state)?;
+    Some(match base {
+        0 => 0x40,
+        0x80 => 0xc0,
+        other => other,
+    })
+}
+
 extern "C" fn ffxCreateContext(
     context: *mut *mut c_void,
     desc: *mut Header,
     memory: *const c_void,
 ) -> u32 {
-    let Some(host) = HOST.get() else {
+    let Some(provider) = PROVIDER.get() else {
         return NO_PROVIDER;
     };
     if context.is_null() || desc.is_null() {
@@ -440,81 +529,123 @@ extern "C" fn ffxCreateContext(
     }
     // SAFETY: an upscaler description, by its type.
     let mut upscale = Box::new(unsafe { desc.cast::<CreateUpscale>().read() });
-    let mut backend = Box::new(Backend {
-        header: Header {
-            kind: HOST_BACKEND,
-            next: null_mut(),
-        },
-        device: host.device.as_raw(),
-    });
-    link(&mut upscale, &mut backend);
-    let mut requested = Box::new(OverrideVersion {
-        header: Header {
-            kind: OVERRIDE_VERSION,
-            next: backend.header.next,
-        },
-        id: host.provider_id,
-    });
-    backend.header.next = &raw mut requested.header;
-    // SAFETY: a PC chain; the title's later descriptions live for the call.
-    let code = unsafe { (host.create)(context, &mut upscale.header, memory) };
-    if code != OK {
-        tracing::error!(code, render = ?upscale.max_render, output = ?upscale.max_output, flags = format_args!("{:#x}", upscale.flags), "FidelityFX: the host refused the title's upscaler");
-        return code;
+    match provider {
+        Provider::Dlss => {
+            let instance = match super::dlss::DlssInstance::new(
+                upscale.flags,
+                upscale.max_render,
+                upscale.max_output,
+            ) {
+                Ok(inst) => inst,
+                Err(err) => {
+                    tracing::error!(
+                        %err,
+                        render = ?upscale.max_render,
+                        output = ?upscale.max_output,
+                        flags = format_args!("{:#x}", upscale.flags),
+                        "DLSS: failed to allocate upscaler context"
+                    );
+                    return NO_PROVIDER;
+                }
+            };
+            let handle = Box::into_raw(Box::new(0usize)).cast::<c_void>();
+            // SAFETY: caller passes writable context slot.
+            unsafe { *context = handle };
+            tracing::info!(
+                provider = "DLSS 3/4",
+                render = ?upscale.max_render,
+                output = ?upscale.max_output,
+                flags = format_args!("{:#x}", upscale.flags),
+                "FidelityFX: DLSS upscaler context on the host"
+            );
+            CONTEXTS.lock().unwrap_or_else(|e| e.into_inner()).insert(
+                handle as usize,
+                Arc::new(Context {
+                    live: Mutex::new(true),
+                    first_dispatch: std::sync::Once::new(),
+                    backend: ContextBackend::Dlss(Mutex::new(instance)),
+                }),
+            );
+            OK
+        }
+        Provider::FidelityFx(host) => {
+            let mut backend = Box::new(Backend {
+                header: Header {
+                    kind: HOST_BACKEND,
+                    next: null_mut(),
+                },
+                device: host.device.as_raw(),
+            });
+            link(&mut upscale, &mut backend);
+            let mut requested = Box::new(OverrideVersion {
+                header: Header {
+                    kind: OVERRIDE_VERSION,
+                    next: backend.header.next,
+                },
+                id: host.provider_id,
+            });
+            backend.header.next = &raw mut requested.header;
+            // SAFETY: a PC chain; the title's later descriptions live for the call.
+            let code = unsafe { (host.create)(context, &mut upscale.header, memory) };
+            if code != OK {
+                tracing::error!(code, render = ?upscale.max_render, output = ?upscale.max_output, flags = format_args!("{:#x}", upscale.flags), "FidelityFX: the host refused the title's upscaler");
+                return code;
+            }
+            let mut version = ProviderVersion {
+                header: Header {
+                    kind: GET_PROVIDER_VERSION,
+                    next: null_mut(),
+                },
+                id: 0,
+                name: null(),
+            };
+            // SAFETY: a provider query on the context just made.
+            let query_code = unsafe { (host.query)(context, &mut version.header) };
+            // SAFETY: a NUL-terminated name the DLL keeps, if any.
+            let name = (!version.name.is_null())
+                .then(|| unsafe { CStr::from_ptr(version.name) }.to_string_lossy());
+            if query_code != OK
+                || version.id != host.provider_id
+                || name.as_deref() != Some(host.provider_name.as_str())
+            {
+                tracing::warn!(
+                    query_code,
+                    provider = name.as_deref().unwrap_or("?"),
+                    requested = host.provider_name,
+                    "FidelityFX created a different provider than the one requested"
+                );
+                // SAFETY: the PC provider just created the context with this allocator.
+                unsafe { (host.destroy)(context, memory) };
+                return NO_PROVIDER;
+            }
+            // SAFETY: a successful SDK creation wrote an opaque context into this slot.
+            tracing::info!(
+                provider = name.as_deref().unwrap_or("?"),
+                id = format_args!("{:#x}", version.id),
+                render = ?upscale.max_render,
+                output = ?upscale.max_output,
+                flags = format_args!("{:#x}", upscale.flags),
+                "FidelityFX: upscaler context on the host"
+            );
+            CONTEXTS.lock().unwrap_or_else(|e| e.into_inner()).insert(
+                unsafe { *context } as usize,
+                Arc::new(Context {
+                    live: Mutex::new(true),
+                    first_dispatch: std::sync::Once::new(),
+                    backend: ContextBackend::FidelityFx(CreateChain {
+                        description: upscale,
+                        _backend: backend,
+                        _version: requested,
+                    }),
+                }),
+            );
+            OK
+        }
     }
-    let mut version = ProviderVersion {
-        header: Header {
-            kind: GET_PROVIDER_VERSION,
-            next: null_mut(),
-        },
-        id: 0,
-        name: null(),
-    };
-    // SAFETY: a provider query on the context just made.
-    let query_code = unsafe { (host.query)(context, &mut version.header) };
-    // SAFETY: a NUL-terminated name the DLL keeps, if any.
-    let name = (!version.name.is_null())
-        .then(|| unsafe { CStr::from_ptr(version.name) }.to_string_lossy());
-    if query_code != OK
-        || version.id != host.provider_id
-        || name.as_deref() != Some(host.provider_name.as_str())
-    {
-        tracing::warn!(
-            query_code,
-            provider = name.as_deref().unwrap_or("?"),
-            requested = host.provider_name,
-            "FidelityFX created a different provider than the one requested"
-        );
-        // SAFETY: the PC provider just created the context with this allocator.
-        unsafe { (host.destroy)(context, memory) };
-        return NO_PROVIDER;
-    }
-    // SAFETY: a successful SDK creation wrote an opaque context into this slot.
-    tracing::info!(
-        provider = name.as_deref().unwrap_or("?"),
-        id = format_args!("{:#x}", version.id),
-        render = ?upscale.max_render,
-        output = ?upscale.max_output,
-        flags = format_args!("{:#x}", upscale.flags),
-        "FidelityFX: upscaler context on the host"
-    );
-    CONTEXTS.lock().unwrap_or_else(|e| e.into_inner()).insert(
-        unsafe { *context } as usize,
-        Arc::new(Context {
-            live: Mutex::new(true),
-            first_dispatch: std::sync::Once::new(),
-            creation: CreateChain {
-                description: upscale,
-                _backend: backend,
-                _version: requested,
-            },
-        }),
-    );
-    OK
 }
 
 extern "C" fn ffxDestroyContext(context: *mut *mut c_void, memory: *const c_void) -> u32 {
-    let Some(host) = HOST.get() else {
+    let Some(provider) = PROVIDER.get() else {
         return NO_PROVIDER;
     };
     if context.is_null() {
@@ -532,33 +663,64 @@ extern "C" fn ffxDestroyContext(context: *mut *mut c_void, memory: *const c_void
     if !*live {
         return PARAMETER;
     }
-    // The guest releases a context after submitting its frames. The host
-    // may still be executing their lists, even after guest Execute returns.
-    victory_gpu::external::finish_submitted();
-    let code = unsafe { (host.destroy)(context, memory) };
-    if code == OK {
-        *live = false;
-        let mut contexts = CONTEXTS.lock().unwrap_or_else(|e| e.into_inner());
-        // A concurrent Create may already have reused the released SDK address.
-        if contexts
-            .get(&handle)
-            .is_some_and(|current| Arc::ptr_eq(current, &ctx))
-        {
-            contexts.remove(&handle);
+    match provider {
+        Provider::Dlss => {
+            *live = false;
+            drop(live);
+            let mut contexts = CONTEXTS.lock().unwrap_or_else(|e| e.into_inner());
+            if contexts
+                .get(&handle)
+                .is_some_and(|current| Arc::ptr_eq(current, &ctx))
+            {
+                contexts.remove(&handle);
+            }
+            drop(contexts);
+            drop(ctx);
+            if handle != 0 {
+                // SAFETY: synthetic box allocated in `ffxCreateContext` for DLSS handle uniqueness.
+                unsafe {
+                    drop(Box::from_raw(handle as *mut usize));
+                    *context = null_mut();
+                }
+            }
+            OK
+        }
+        Provider::FidelityFx(host) => {
+            // The guest releases a context after submitting its frames. The host
+            // may still be executing their lists, even after guest Execute returns.
+            victory_gpu::external::finish_submitted();
+            // SAFETY: live SDK context and allocator.
+            let code = unsafe { (host.destroy)(context, memory) };
+            if code == OK {
+                *live = false;
+                let mut contexts = CONTEXTS.lock().unwrap_or_else(|e| e.into_inner());
+                // A concurrent Create may already have reused the released SDK address.
+                if contexts
+                    .get(&handle)
+                    .is_some_and(|current| Arc::ptr_eq(current, &ctx))
+                {
+                    contexts.remove(&handle);
+                }
+            }
+            code
         }
     }
-    code
 }
 
 /// Settings (key-value pairs, debug messages) name nothing console-specific.
 extern "C" fn ffxConfigure(context: *mut *mut c_void, desc: *mut Header) -> u32 {
-    // SAFETY: the title passes its context and descriptions.
-    HOST.get()
-        .map_or(NO_PROVIDER, |h| unsafe { (h.configure)(context, desc) })
+    match PROVIDER.get() {
+        Some(Provider::FidelityFx(h)) => {
+            // SAFETY: the title passes its context and descriptions.
+            unsafe { (h.configure)(context, desc) }
+        }
+        Some(Provider::Dlss) => OK,
+        None => NO_PROVIDER,
+    }
 }
 
 extern "C" fn ffxQuery(context: *mut *mut c_void, desc: *mut Header) -> u32 {
-    let Some(host) = HOST.get() else {
+    let Some(provider) = PROVIDER.get() else {
         return NO_PROVIDER;
     };
     if desc.is_null() {
@@ -566,31 +728,138 @@ extern "C" fn ffxQuery(context: *mut *mut c_void, desc: *mut Header) -> u32 {
     }
     // SAFETY: the title passes a description.
     let kind = unsafe { (*desc).kind };
-    // Substitute the native device; the SDK returns values through the
-    // title's original output pointers in both request structures.
-    if kind == GET_VERSIONS {
-        let mut query = unsafe { *desc.cast::<GetVersions>() };
-        query.device = host.device.as_raw();
-        return unsafe { (host.query)(context, &mut query.header) };
+    match provider {
+        Provider::Dlss => dlss_query(kind, desc),
+        Provider::FidelityFx(host) => {
+            // Substitute the native device; the SDK returns values through the
+            // title's original output pointers in both request structures.
+            if kind == GET_VERSIONS {
+                // SAFETY: caller passes a valid GetVersions description.
+                let mut query = unsafe { *desc.cast::<GetVersions>() };
+                query.device = host.device.as_raw();
+                // SAFETY: forwarded with valid device.
+                return unsafe { (host.query)(context, &mut query.header) };
+            }
+            if kind == MEMORY_USAGE_WITH_DEVICE {
+                // SAFETY: caller passes a valid MemoryUsageWithDevice description.
+                let mut query = unsafe { *desc.cast::<MemoryUsageWithDevice>() };
+                query.device = host.device.as_raw();
+                // SAFETY: forwarded with valid device.
+                return unsafe { (host.query)(context, &mut query.header) };
+            }
+            // SAFETY: as above.
+            let code = unsafe { (host.query)(context, desc) };
+            if kind == GET_JITTER_PHASE_COUNT && code == OK {
+                // Prevent divide-by-zero in the title at 0.5x / ultra-perf ratios
+                // when an SDK returns 0 jitter phases.
+                // SAFETY: verified query type `GET_JITTER_PHASE_COUNT`.
+                let q = unsafe { *desc.cast::<JitterPhaseCountQuery>() };
+                if !q.count.is_null() && unsafe { *q.count } <= 0 {
+                    // SAFETY: checked non-null output pointer.
+                    unsafe {
+                        *q.count = super::dlss::jitter_phase_count(q.render_width, q.output_width);
+                    }
+                }
+            }
+            if kind == GET_RENDER_RESOLUTION && code != OK {
+                tracing::warn!(
+                    code,
+                    "FidelityFX provider refused the render-resolution query"
+                );
+            }
+            code
+        }
     }
-    if kind == MEMORY_USAGE_WITH_DEVICE {
-        let mut query = unsafe { *desc.cast::<MemoryUsageWithDevice>() };
-        query.device = host.device.as_raw();
-        return unsafe { (host.query)(context, &mut query.header) };
+}
+
+fn dlss_query(kind: u64, desc: *mut Header) -> u32 {
+    // SAFETY: `desc` was checked non-null and its `kind` determines its exact `#[repr(C)]` layout.
+    unsafe {
+        match kind {
+            GET_VERSIONS => {
+                let q = &*desc.cast::<GetVersions>();
+                if q.count.is_null() {
+                    return PARAMETER;
+                }
+                *q.count = 1;
+                if !q.ids.is_null() {
+                    *q.ids = DLSS_PROVIDER_ID;
+                }
+                if !q.names.is_null() {
+                    *q.names = DLSS_PROVIDER_NAME.as_ptr();
+                }
+                OK
+            }
+            GET_PROVIDER_VERSION => {
+                let q = &mut *desc.cast::<ProviderVersion>();
+                q.id = DLSS_PROVIDER_ID;
+                q.name = DLSS_PROVIDER_NAME.as_ptr();
+                OK
+            }
+            GET_UPSCALE_RATIO => {
+                let q = &*desc.cast::<RatioQuery>();
+                let Some(ratio) = super::dlss::ffx_quality_ratio(q.quality) else {
+                    return PARAMETER;
+                };
+                if q.ratio.is_null() {
+                    return PARAMETER;
+                }
+                *q.ratio = ratio;
+                OK
+            }
+            GET_RENDER_RESOLUTION => {
+                let q = &*desc.cast::<RenderResolutionQuery>();
+                let Some([w, h]) = super::dlss::query_optimal_resolution(q.display, q.quality) else {
+                    return PARAMETER;
+                };
+                if q.width.is_null() || q.height.is_null() {
+                    return PARAMETER;
+                }
+                *q.width = w;
+                *q.height = h;
+                OK
+            }
+            GET_JITTER_PHASE_COUNT => {
+                let q = &*desc.cast::<JitterPhaseCountQuery>();
+                if q.count.is_null() {
+                    return PARAMETER;
+                }
+                *q.count = super::dlss::jitter_phase_count(q.render_width, q.output_width);
+                OK
+            }
+            GET_JITTER_OFFSET => {
+                let q = &*desc.cast::<JitterOffsetQuery>();
+                if q.x.is_null() || q.y.is_null() {
+                    return PARAMETER;
+                }
+                let [jx, jy] = super::dlss::jitter_offset(q.index, q.phases);
+                *q.x = jx;
+                *q.y = jy;
+                OK
+            }
+            MEMORY_USAGE => {
+                let q = &*desc.cast::<MemoryUsageQuery>();
+                if q.usage.is_null() {
+                    return PARAMETER;
+                }
+                *q.usage = super::dlss::query_memory_usage();
+                OK
+            }
+            MEMORY_USAGE_WITH_DEVICE => {
+                let q = &*desc.cast::<MemoryUsageWithDevice>();
+                if q.usage.is_null() {
+                    return PARAMETER;
+                }
+                *q.usage.cast::<[u64; 2]>() = super::dlss::query_memory_usage();
+                OK
+            }
+            _ => UNKNOWN_TYPE,
+        }
     }
-    // SAFETY: as above.
-    let code = unsafe { (host.query)(context, desc) };
-    if kind == GET_RENDER_RESOLUTION && code != OK {
-        tracing::warn!(
-            code,
-            "FidelityFX provider refused the render-resolution query"
-        );
-    }
-    code
 }
 
 extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
-    let Some(host) = HOST.get() else {
+    let Some(provider) = PROVIDER.get() else {
         return NO_PROVIDER;
     };
     if desc.is_null() {
@@ -641,21 +910,34 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
     if !*live {
         return PARAMETER;
     }
-    let create = &ctx.creation.description;
+    let (max_render, max_output, create_flags) = match &ctx.backend {
+        ContextBackend::FidelityFx(chain) => (
+            chain.description.max_render,
+            chain.description.max_output,
+            chain.description.flags,
+        ),
+        ContextBackend::Dlss(inst) => inst.lock().unwrap_or_else(|e| e.into_inner()).bounds(),
+    };
     let Some(output_size) = dispatch_output(
         dispatch.render_size,
         dispatch.upscale_size,
-        create.max_render,
-        create.max_output,
+        max_render,
+        max_output,
     ) else {
         once!(warn, render = ?dispatch.render_size, output = ?dispatch.upscale_size,
-            max_render = ?create.max_render, max_output = ?create.max_output,
+            max_render = ?max_render, max_output = ?max_output,
             "FidelityFX rejected dispatch dimensions outside the context's allocations");
         return PARAMETER;
     };
     let list = dispatch.list.cast::<Object>().cast_const();
-    victory_gpu::external::record(list, |list| {
-        record_dispatch(list, host, context, &ctx, &mut dispatch, output_size)
+    victory_gpu::external::record(list, |list| match (provider, &ctx.backend) {
+        (Provider::FidelityFx(host), ContextBackend::FidelityFx(_)) => {
+            record_dispatch(list, host, context, &ctx, create_flags, &mut dispatch, output_size)
+        }
+        (Provider::Dlss, ContextBackend::Dlss(inst)) => {
+            record_dlss_dispatch(list, inst, &ctx, create_flags, &mut dispatch, output_size)
+        }
+        _ => PARAMETER,
     })
     .unwrap_or_else(|| {
         once!(
@@ -666,11 +948,105 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
     })
 }
 
+fn record_dlss_dispatch(
+    list: &victory_gpu::external::Recording<'_>,
+    inst: &Mutex<super::dlss::DlssInstance>,
+    ctx: &Context,
+    create_flags: u32,
+    dispatch: &mut DispatchUpscale,
+    output_size: [u32; 2],
+) -> u32 {
+    let output = dispatch.resources[6].resource.cast::<Object>();
+    let mut textures = Vec::new();
+    let mut backing_extents = [None; 7];
+    let mut raw_ptrs = [null_mut(); 7];
+
+    for (index, r) in dispatch.resources.iter().enumerate() {
+        if r.resource.is_null() {
+            continue;
+        }
+        if index < 6 && list.prepare_input(r.resource.cast::<Object>()).is_none() {
+            once!(
+                warn,
+                index,
+                "DLSS input could not be prepared on the title command list"
+            );
+            return PARAMETER;
+        }
+        let wanted = if index == 6 {
+            Some(0x8)
+        } else {
+            dlss_input_state(r.state)
+        };
+        let texture = wanted.and_then(|w| {
+            list.texture(r.resource.cast::<Object>(), w)
+                .filter(|&(_, state)| state == w)
+        });
+        let Some((texture, _)) = texture else {
+            once!(
+                warn,
+                index,
+                state = r.state,
+                "DLSS: a resource has no host texture in its state; the upscaling did not run"
+            );
+            return PARAMETER;
+        };
+        // SAFETY: live host D3D12 resource.
+        let desc = unsafe { texture.GetDesc() };
+        backing_extents[index] = Some((desc.Width, desc.Height));
+        let needed = minimum_extent(index, create_flags, dispatch.render_size, output_size);
+        if desc.Width < u64::from(needed[0]) || desc.Height < needed[1] {
+            once!(
+                warn,
+                index,
+                ?needed,
+                width = desc.Width,
+                height = desc.Height,
+                "DLSS resource cannot cover the active dispatch rectangle"
+            );
+            return PARAMETER;
+        }
+        raw_ptrs[index] = texture.as_raw();
+        textures.push(texture);
+    }
+
+    let mut guard = inst.lock().unwrap_or_else(|e| e.into_inner());
+    match guard.dispatch(&super::dlss::DlssEval {
+        cmd_list: list.commands().as_raw(),
+        resources: raw_ptrs,
+        jitter: dispatch.jitter,
+        motion_scale: dispatch.motion_scale,
+        render_size: dispatch.render_size,
+        output_size,
+        settings: dispatch.settings,
+    }) {
+        Ok(()) => {
+            victory_gpu::external::output_written(output);
+            ctx.first_dispatch.call_once(|| {
+                tracing::info!(
+                    render = ?dispatch.render_size,
+                    output = ?output_size,
+                    ?backing_extents,
+                    jitter = ?dispatch.jitter,
+                    motion_vector_scale = ?dispatch.motion_scale,
+                    "NVIDIA DLSS recorded the title's temporal dispatch"
+                );
+            });
+            OK
+        }
+        Err(err) => {
+            once!(warn, %err, "NVIDIA DLSS dispatch failed");
+            PARAMETER
+        }
+    }
+}
+
 fn record_dispatch(
     list: &victory_gpu::external::Recording<'_>,
     host: &Host,
     context: *mut *mut c_void,
     ctx: &Context,
+    create_flags: u32,
     dispatch: &mut DispatchUpscale,
     output_size: [u32; 2],
 ) -> u32 {
@@ -704,11 +1080,12 @@ fn record_dispatch(
             );
             return PARAMETER;
         };
+        // SAFETY: live host D3D12 resource.
         let desc = unsafe { texture.GetDesc() };
         backing_extents[index] = Some((desc.Width, desc.Height));
         let needed = minimum_extent(
             index,
-            ctx.creation.description.flags,
+            create_flags,
             dispatch.render_size,
             output_size,
         );
@@ -893,5 +1270,60 @@ mod tests {
         assert_eq!(host_state(0x2), Some(0x8));
         assert_eq!(host_state(0x200), Some(0x10));
         assert_eq!(host_state(0x14), None);
+        assert_eq!(dlss_input_state(0x1), Some(0x40));
+        assert_eq!(dlss_input_state(0x8), Some(0xc0));
+        assert_eq!(dlss_input_state(0x4), Some(0x40));
+    }
+
+    #[test]
+    fn dlss_queries_cover_all_fidelityfx_query_structs() {
+        let mut ratio = 0.0f32;
+        let mut rq = RatioQuery {
+            header: Header { kind: GET_UPSCALE_RATIO, next: null_mut() },
+            quality: 1,
+            ratio: &raw mut ratio,
+        };
+        assert_eq!(dlss_query(GET_UPSCALE_RATIO, &raw mut rq.header), OK);
+        assert_eq!(ratio, 1.5);
+
+        let (mut rw, mut rh) = (0u32, 0u32);
+        let mut resq = RenderResolutionQuery {
+            header: Header { kind: GET_RENDER_RESOLUTION, next: null_mut() },
+            display: [1920, 1080],
+            quality: 1,
+            width: &raw mut rw,
+            height: &raw mut rh,
+        };
+        assert_eq!(dlss_query(GET_RENDER_RESOLUTION, &raw mut resq.header), OK);
+        assert_eq!([rw, rh], [1280, 720]);
+
+        let mut phases = 0i32;
+        let mut pc = JitterPhaseCountQuery {
+            header: Header { kind: GET_JITTER_PHASE_COUNT, next: null_mut() },
+            render_width: 960,
+            output_width: 1920,
+            count: &raw mut phases,
+        };
+        assert_eq!(dlss_query(GET_JITTER_PHASE_COUNT, &raw mut pc.header), OK);
+        assert!(phases >= 8);
+
+        let (mut jx, mut jy) = (f32::NAN, f32::NAN);
+        let mut jo = JitterOffsetQuery {
+            header: Header { kind: GET_JITTER_OFFSET, next: null_mut() },
+            index: 0,
+            phases,
+            x: &raw mut jx,
+            y: &raw mut jy,
+        };
+        assert_eq!(dlss_query(GET_JITTER_OFFSET, &raw mut jo.header), OK);
+        assert!(jx.abs() <= 0.5 && jy.abs() <= 0.5);
+
+        let mut usage = [0u64; 2];
+        let mut mem = MemoryUsageQuery {
+            header: Header { kind: MEMORY_USAGE, next: null_mut() },
+            usage: &raw mut usage,
+        };
+        assert_eq!(dlss_query(MEMORY_USAGE, &raw mut mem.header), OK);
+        assert!(usage[0] > 0);
     }
 }

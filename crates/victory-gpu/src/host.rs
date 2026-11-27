@@ -169,11 +169,20 @@ pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
     const KEPT_MS: u64 = 600_000;
     const IDLE_MS: u64 = 5_000;
     const SHORT_MS: u64 = 3_000;
+    const SEVEN_GIB: u64 = 7 << 30;
     if budget == 0 {
         return (IDLE_MS, u64::MAX);
     }
     let share = |percent: u64| budget / 100 * percent;
-    if used < share(85) {
+    if budget <= SEVEN_GIB {
+        if used < share(78) {
+            (KEPT_MS, u64::MAX)
+        } else if used < share(88) {
+            (IDLE_MS, used - share(74))
+        } else {
+            (SHORT_MS, used - share(78))
+        }
+    } else if used < share(85) {
         (KEPT_MS, u64::MAX)
     } else if used < share(93) {
         (IDLE_MS, used - share(80))
@@ -1131,6 +1140,30 @@ impl Host {
         // SAFETY: a plain query.
         adapter.map_or(0, |a| unsafe { a.CheckInterfaceSupport(&IDXGIDevice::IID) }.unwrap_or(0))
     }
+
+    /// PCI vendor ID of this host adapter (`0x10DE` NVIDIA, `0x1002` AMD, etc.).
+    pub(crate) fn vendor_id(&self) -> Option<u32> {
+        let adapter = self.adapter.as_ref()?;
+        // SAFETY: plain DXGI query.
+        unsafe { adapter.GetDesc1() }.ok().map(|d| d.VendorId)
+    }
+
+    /// LUID of this host adapter `(LowPart, HighPart)`.
+    pub(crate) fn adapter_luid(&self) -> (u32, i32) {
+        // SAFETY: plain D3D12 query.
+        let luid = unsafe { self.device.GetAdapterLuid() };
+        (luid.LowPart, luid.HighPart)
+    }
+}
+
+/// Estimated system-RAM commit held by VIctory's host D3D12 emulation layers
+/// (CPU shadow buffers, texture staging buffers, list scratch chunks, and
+/// command-list allocators) that would not exist in an Xbox title's working set.
+pub(crate) fn host_overhead_bytes() -> u64 {
+    crate::shadow::live_span_bytes()
+        .saturating_add(crate::texture::live_staging_bytes())
+        .saturating_add(ALIVE[2].load(Ordering::Relaxed))
+        .saturating_add(ALIVE[0].load(Ordering::Relaxed).saturating_mul(2 << 20))
 }
 
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
@@ -2108,7 +2141,14 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
             let back = if scratch_pool() {
-                let limit = if keep_freed() && !crate::residency::limited_host_ram() { SPARE_KEPT } else { SPARE_MOST };
+                const GIB: u64 = 1 << 30;
+                let limit = if keep_freed() && !crate::residency::limited_host_ram() {
+                    SPARE_KEPT
+                } else if crate::residency::total_physical_ram().is_some_and(|t| t <= 16 * GIB) {
+                    64 << 20
+                } else {
+                    SPARE_MOST
+                };
                 spare.give(chunk, size, limit)
             } else {
                 Some(chunk)
@@ -9205,13 +9245,40 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     })
 }
 
-const BUFFERS: u32 = 2;
+const BUFFERS: u32 = 3;
+
+fn allow_tearing_asked() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ALLOW_TEARING").is_none_or(|v| v != "0"))
+}
+
+fn vsync_asked() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VSYNC").is_some_and(|v| v == "1"))
+}
+
+fn tearing_supported(factory: &IDXGIFactory2) -> bool {
+    let Ok(factory5) = factory.cast::<IDXGIFactory5>() else {
+        return false;
+    };
+    let mut supported: u32 = 0;
+    // SAFETY: valid pointer and byte size for DXGI_FEATURE_PRESENT_ALLOW_TEARING.
+    let ok = unsafe {
+        factory5.CheckFeatureSupport(
+            DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+            (&raw mut supported).cast(),
+            size_of::<u32>() as u32,
+        )
+    };
+    ok.is_ok() && supported != 0
+}
 
 struct Presenter {
     swap_chain: IDXGISwapChain3,
     width: u32,
     height: u32,
     format: DXGI_FORMAT,
+    tearing: bool,
     copy: HostList,
     /// With presents sent ahead ([`late_free_present`]): a list for each
     /// present in the air, and the submission it last flew as (it is used
@@ -9701,10 +9768,15 @@ impl Host {
         if (p.width, p.height, p.format) != (width, height, format) {
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
+            let flags = if p.tearing {
+                DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING
+            } else {
+                DXGI_SWAP_CHAIN_FLAG(0)
+            };
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
-                    .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+                    .ResizeBuffers(BUFFERS, width, height, format, flags)
             };
             match resized {
                 Ok(()) => {
@@ -9919,7 +9991,17 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
-            let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let vsync = vsync_asked();
+            let mut status = if p.tearing && !vsync {
+                p.swap_chain.Present(0, DXGI_PRESENT_ALLOW_TEARING)
+            } else {
+                p.swap_chain.Present(u32::from(vsync), DXGI_PRESENT(0))
+            };
+            const DXGI_ERROR_INVALID_CALL_CODE: i32 = 0x887A_0001u32 as i32;
+            if p.tearing && !vsync && status.0 == DXGI_ERROR_INVALID_CALL_CODE {
+                p.tearing = false;
+                status = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            }
             showing.next("the frame meter");
             if status == windows::Win32::Foundation::S_OK {
                 p.panel.frame(p.meter.line_due());
@@ -9948,6 +10030,7 @@ impl Host {
         // SAFETY: plain object creation for our window.
         unsafe {
             let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            let tearing = allow_tearing_asked() && tearing_supported(&factory);
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,
@@ -9959,6 +10042,11 @@ impl Host {
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
                 BufferCount: BUFFERS,
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                Flags: if tearing {
+                    DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32
+                } else {
+                    0
+                },
                 ..Default::default()
             };
             let swap_chain = factory
@@ -9966,13 +10054,21 @@ impl Host {
                 .cast::<IDXGISwapChain3>()?;
             let copy = self.new_list()?;
             copy.close();
-            tracing::info!(width, height, format = format.0, "presenting to a window");
+            tracing::info!(
+                width,
+                height,
+                format = format.0,
+                buffers = BUFFERS,
+                tearing,
+                "presenting to a window"
+            );
             self.log_video_memory("right after the swap chain is made");
             Ok(Presenter {
                 swap_chain,
                 width,
                 height,
                 format,
+                tearing,
                 copy,
                 ahead: Vec::new(),
                 hwnd,
@@ -10518,6 +10614,9 @@ extern "system" fn window_proc(
 
 fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
     const CLASS: PCWSTR = w!("VIctory");
+    let borderless = std::env::var("VICTORY_WINDOW_MODE")
+        .ok()
+        .is_some_and(|m| matches!(m.trim().to_ascii_lowercase().as_str(), "borderless" | "fullscreen"));
     // SAFETY: registers our class once and creates a window of it.
     unsafe {
         let instance = GetModuleHandleW(None)?;
@@ -10530,6 +10629,22 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             ..Default::default()
         };
         RegisterClassExW(&class);
+        if borderless && let Some((x, y, w, h)) = crate::external::primary_monitor_bounds() {
+            return CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                CLASS,
+                w!("VIctory"),
+                WS_POPUP | WS_VISIBLE,
+                x,
+                y,
+                w,
+                h,
+                None,
+                None,
+                Some(instance.into()),
+                None,
+            );
+        }
         let mut rect = RECT {
             left: 0,
             top: 0,

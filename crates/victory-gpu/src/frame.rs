@@ -153,6 +153,25 @@ fn next_tick(kind: u32) -> (u64, Duration) {
     )
 }
 
+/// Sleeps down to ~1.5 ms before `wait`, then spins cleanly to eliminate
+/// Windows scheduler wakeup jitter during 60 fps pacing or Lossless Scaling.
+fn wait_precise(wait: Duration) {
+    static SPIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let spin = *SPIN.get_or_init(|| std::env::var_os("VICTORY_PACE_SPIN").is_none_or(|v| v != "0"));
+    if !spin {
+        std::thread::sleep(wait);
+        return;
+    }
+    const SPIN_TAIL: Duration = Duration::from_micros(1_500);
+    let deadline = Instant::now() + wait;
+    if wait > Duration::from_millis(2) {
+        std::thread::sleep(wait - SPIN_TAIL);
+    }
+    while Instant::now() < deadline {
+        std::hint::spin_loop();
+    }
+}
+
 /// Device method: blocks until the next tick (or the time-out); an origin
 /// wait then hands out the new frame's token. Other events keep the token
 /// the title passes. Ticks are absolute (start plus whole intervals), so
@@ -188,7 +207,7 @@ pub(crate) extern "system" fn wait(
         TIMEOUT
     } else {
         if !wait.is_zero() {
-            std::thread::sleep(wait);
+            wait_precise(wait);
         }
         last(kind).fetch_max(tick, Ordering::Relaxed);
         S_OK

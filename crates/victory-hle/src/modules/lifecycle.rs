@@ -110,8 +110,9 @@ pub extern "system" fn CreateWindowExW(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
-    // SAFETY: the title's own arguments, forwarded (the size fitted).
+    let (ex_style, style, x, y, width, height) =
+        shape_window(parent, ex_style, style, x, y, width, height);
+    // SAFETY: the title's own arguments, forwarded (the size and style fitted).
     let hwnd = unsafe {
         wm::CreateWindowExW(
             ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
@@ -136,8 +137,9 @@ pub extern "system" fn CreateWindowExA(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
-    // SAFETY: the title's own arguments, forwarded (the size fitted).
+    let (ex_style, style, x, y, width, height) =
+        shape_window(parent, ex_style, style, x, y, width, height);
+    // SAFETY: the title's own arguments, forwarded (the size and style fitted).
     let hwnd = unsafe {
         wm::CreateWindowExA(
             ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
@@ -145,6 +147,91 @@ pub extern "system" fn CreateWindowExA(
     };
     hook(hwnd);
     hwnd
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowMode {
+    Windowed,
+    Borderless,
+}
+
+fn parse_window_mode(value: &str) -> Option<WindowMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "windowed" | "0" => Some(WindowMode::Windowed),
+        "borderless" | "fullscreen" => Some(WindowMode::Borderless),
+        _ => None,
+    }
+}
+
+fn window_mode() -> WindowMode {
+    static MODE: std::sync::OnceLock<WindowMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        let Some(val) = std::env::var_os("VICTORY_WINDOW_MODE") else {
+            return WindowMode::Windowed;
+        };
+        let parsed = val.to_str().and_then(parse_window_mode);
+        if parsed.is_none() {
+            tracing::warn!(
+                ?val,
+                "ignoring invalid VICTORY_WINDOW_MODE; expected windowed, borderless or fullscreen"
+            );
+        }
+        parsed.unwrap_or(WindowMode::Windowed)
+    })
+}
+
+fn monitor_bounds() -> Option<(i32, i32, i32, i32)> {
+    #[cfg(windows)]
+    if let Some(bounds) = victory_gpu::external::primary_monitor_bounds() {
+        return Some(bounds);
+    }
+    // SAFETY: plain screen metric queries.
+    let (w, h) = unsafe {
+        (
+            wm::GetSystemMetrics(wm::SM_CXSCREEN),
+            wm::GetSystemMetrics(wm::SM_CYSCREEN),
+        )
+    };
+    (w > 0 && h > 0).then_some((0, 0, w, h))
+}
+
+fn shape_window(
+    parent: HWND,
+    ex_style: u32,
+    style: u32,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> (u32, u32, i32, i32, i32, i32) {
+    if parent.is_null()
+        && window_mode() == WindowMode::Borderless
+        && let Some((mx, my, mw, mh)) = monitor_bounds()
+    {
+        let stripped_style = (style
+            & !(wm::WS_CAPTION
+                | wm::WS_THICKFRAME
+                | wm::WS_MINIMIZEBOX
+                | wm::WS_MAXIMIZEBOX
+                | wm::WS_SYSMENU))
+            | wm::WS_POPUP
+            | wm::WS_VISIBLE;
+        let stripped_ex = ex_style
+            & !(wm::WS_EX_DLGMODALFRAME
+                | wm::WS_EX_WINDOWEDGE
+                | wm::WS_EX_CLIENTEDGE
+                | wm::WS_EX_STATICEDGE);
+        tracing::info!(
+            x = mx,
+            y = my,
+            width = mw,
+            height = mh,
+            "borderless fullscreen window mode active (VICTORY_WINDOW_MODE)"
+        );
+        return (stripped_ex, stripped_style, mx, my, mw, mh);
+    }
+    let (x, y, width, height) = fit(parent, x, y, width, height);
+    (ex_style, style, x, y, width, height)
 }
 
 /// A console title sizes its window to its render target (

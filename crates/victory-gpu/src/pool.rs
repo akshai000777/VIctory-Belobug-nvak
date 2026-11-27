@@ -38,19 +38,49 @@ const STAGING_KEPT: usize = 8;
 /// How many are kept now.
 static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 
+/// How many empty texture-pool blocks stay kept on cards of this VRAM budget.
+fn spare_cap_for_vram(vram_budget: Option<u64>) -> usize {
+    const GIB: u64 = 1 << 30;
+    match vram_budget {
+        None => 8,
+        Some(b) if b <= 6 * GIB => 4,
+        Some(b) if b <= 8 * GIB => 8,
+        Some(b) if b <= 12 * GIB => 16,
+        Some(b) if b <= 16 * GIB => 24,
+        Some(_) => SPARE_KEPT,
+    }
+}
+
+/// How many empty CPU staging-pool blocks stay kept for reuse (`STAGING_KEPT`
+/// on high-RAM hosts, tightened on 16–32 GiB hosts).
+fn staging_kept_limit() -> usize {
+    const GIB: u64 = 1 << 30;
+    if crate::residency::limited_host_ram() {
+        match crate::residency::total_physical_ram() {
+            Some(total) if total <= 16 * GIB => 2,
+            _ => 4,
+        }
+    } else {
+        STAGING_KEPT
+    }
+}
+
 /// Sets how many empty blocks stay, by the card's memory (budget and use):
-/// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
-/// Asked once a second.
+/// scaled up to [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else
+/// [`SPARE`]. Staging spares are bounded independently by [`STAGING_KEPT`] so
+/// PC RAM does not accumulate gigabytes of empty upload heaps.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
+    let budget = memory.map(|[b, ..]| b);
+    let cap = spare_cap_for_vram(budget);
     if !crate::residency::on() {
-        SPARES.store(spares(memory, crate::host::keep_freed()), Ordering::Relaxed);
+        SPARES.store(spares(memory, crate::host::keep_freed()).min(cap), Ordering::Relaxed);
         return;
     }
     // (`VICTORY_RESIDENCY=1`, codec-d/cool_fox c64fc9b4/e94d277a: fewer
     // spares while the system is short of memory, and idle blocks let go now,
     // not at the pool's next allocation.)
     let pressure = crate::residency::pressured();
-    let limit = spares(memory, crate::host::keep_freed() && !pressure);
+    let limit = spares(memory, crate::host::keep_freed() && !pressure).min(cap);
     SPARES.store(limit, Ordering::Relaxed);
     let tick = now();
     if let Ok(mut pool) = TEXTURES.try_lock() {
@@ -62,7 +92,7 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
         } else if pressure {
             1
         } else {
-            limit
+            limit.min(staging_kept_limit())
         };
         pool.reclaim(tick, staging_limit, true);
     }
@@ -103,7 +133,24 @@ pub(crate) fn on() -> bool {
 /// no such lists: pieces are cut from those first.
 fn ahead() -> usize {
     static AHEAD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *AHEAD.get_or_init(|| std::env::var("VICTORY_RIPE_BLOCKS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(12))
+    *AHEAD.get_or_init(|| {
+        if let Some(n) = std::env::var("VICTORY_RIPE_BLOCKS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+        {
+            return n;
+        }
+        const GIB: u64 = 1 << 30;
+        let budget = crate::host::host()
+            .and_then(|h| h.video_memory())
+            .map(|[b, ..]| b);
+        match budget {
+            Some(b) if b <= 6 * GIB => 3,
+            Some(b) if b <= 8 * GIB => 4,
+            Some(b) if b <= 12 * GIB => 6,
+            _ => 12,
+        }
+    })
 }
 
 /// Submissions begun and finished ([`crate::host::submissions`]), and how

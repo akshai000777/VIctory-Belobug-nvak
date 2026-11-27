@@ -1930,9 +1930,16 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
     // SAFETY: our own process and a sized structure.
     unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
     let (gpu_optimal, standard) = victory_gpu::console::current().title_memory();
+    let title_limit = gpu_optimal + standard - TRANSFERRED.load(Ordering::Relaxed);
+    let host_overhead = victory_gpu::external::host_commit_bytes();
+    let raw_commit = counters.PagefileUsage as u64;
+    let adjusted = raw_commit
+        .saturating_sub(host_overhead)
+        .max((raw_commit / 8).min((title_limit / 2) as u64))
+        .max(u64::from(raw_commit > 0));
     let stats = WorkingSet {
-        title_limit: gpu_optimal + standard - TRANSFERRED.load(Ordering::Relaxed),
-        title_used: counters.PagefileUsage,
+        title_limit,
+        title_used: adjusted as usize,
         gpu_optimal_limit: gpu_optimal,
         ..Default::default()
     };

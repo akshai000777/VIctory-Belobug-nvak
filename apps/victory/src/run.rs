@@ -57,7 +57,8 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
-    let fsr = fsr_4k::FsrPreset::requested()?;
+    let upscaler = fsr_4k::UpscalerSelection::requested()?;
+    let asked_output = victory_loader::resolution::asked_output();
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let mut prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
@@ -68,23 +69,90 @@ pub fn run(
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
-    let image = if let Some(preset) = fsr {
-        anyhow::ensure!(matches!(console, Console::SeriesX), "FSR 4K requires Series X mode");
-        fsr_4k::prepare_fsr_4k(&mut prepared, preset)?;
-        let dir = cfg.fidelityfx_dir.as_deref().context(
-            "FSR 4K requires amd_fidelityfx_upscaler_dx12.dll. Set VICTORY_FIDELITYFX_DIR or [paths].fidelityfx_dir to its folder.",
-        )?;
-        // Select the provider before the first lookup builds the import registry.
-        victory_hle::modules::fidelityfx::use_host_dir(dir)
-            .map_err(anyhow::Error::msg)
-            .with_context(|| format!("loading the PC FSR upscaler from {}", dir.display()))?;
-        // SAFETY: Windows supports setting the environment across threads.
-        // No title code has run or queried DXGI yet.
-        unsafe { std::env::set_var("VICTORY_DISPLAY_MODE", "3840x2160") };
-        let cache = cfg.cache_subdir(&format!("images/fsr-{}-4k-sdr", preset.name()))?;
-        victory_loader::load(&prepared, &cache)?
+    let (image, upscaler_output) = if let Some(sel) = upscaler {
+        if sel.from_fsr_4k {
+            anyhow::ensure!(
+                matches!(console, Console::SeriesX),
+                "FSR 4K requires Series X mode"
+            );
+        }
+        let output = if sel.from_fsr_4k {
+            [3840, 2160]
+        } else {
+            asked_output
+                .map(|(w, h)| [w, h])
+                .unwrap_or(match console {
+                    Console::SeriesS => [1920, 1080],
+                    Console::SeriesX => [3840, 2160],
+                })
+        };
+        let (backend_tag, backend_label) = match sel.backend {
+            fsr_4k::UpscalerBackend::Dlss => {
+                match victory_hle::modules::fidelityfx::use_dlss(cfg.dlss_dir.as_deref()) {
+                    Ok(()) => ("dlss", "DLSS"),
+                    Err(dlss_err) => {
+                        if let Some(fsr_dir) = cfg.fidelityfx_dir.as_deref() {
+                            tracing::warn!(
+                                error = %dlss_err,
+                                "DLSS unavailable; falling back to PC FidelityFX"
+                            );
+                            victory_hle::modules::fidelityfx::use_host_dir(fsr_dir)
+                                .map_err(anyhow::Error::msg)
+                                .with_context(|| {
+                                    format!(
+                                        "loading the PC FSR upscaler from {}",
+                                        fsr_dir.display()
+                                    )
+                                })?;
+                            ("fsr", "FSR")
+                        } else {
+                            return Err(anyhow::Error::msg(dlss_err));
+                        }
+                    }
+                }
+            }
+            fsr_4k::UpscalerBackend::FidelityFx => {
+                let dir = cfg.fidelityfx_dir.as_deref().context(
+                    "FSR requires amd_fidelityfx_upscaler_dx12.dll. Set VICTORY_FIDELITYFX_DIR or [paths].fidelityfx_dir to its folder.",
+                )?;
+                // Select the provider before the first lookup builds the import registry.
+                victory_hle::modules::fidelityfx::use_host_dir(dir)
+                    .map_err(anyhow::Error::msg)
+                    .with_context(|| {
+                        format!("loading the PC FSR upscaler from {}", dir.display())
+                    })?;
+                ("fsr", "FSR")
+            }
+        };
+        fsr_4k::prepare_upscaler(&mut prepared, sel.preset, backend_label, output)?;
+        if sel.from_fsr_4k || std::env::var_os("VICTORY_DISPLAY_MODE").is_none() {
+            // SAFETY: Windows supports setting the environment across threads.
+            // No title code has run or queried DXGI yet.
+            unsafe {
+                std::env::set_var(
+                    "VICTORY_DISPLAY_MODE",
+                    format!("{}x{}", output[0], output[1]),
+                )
+            };
+        }
+        let cache = if sel.from_fsr_4k {
+            cfg.cache_subdir(&format!("images/fsr-{}-4k-sdr", sel.preset.name()))?
+        } else {
+            cfg.cache_subdir(&format!(
+                "images/{backend_tag}-{}-{}x{}-sdr",
+                sel.preset.name(),
+                output[0],
+                output[1]
+            ))?
+        };
+        let needs_output_patch = !sel.from_fsr_4k
+            && (asked_output.is_some() || matches!(console, Console::SeriesS));
+        (
+            victory_loader::load(&prepared, &cache)?,
+            needs_output_patch.then_some(output),
+        )
     } else {
-        victory_loader::load(&prepared, &images)?
+        (victory_loader::load(&prepared, &images)?, None)
     };
     // The program is mapped from the copy `load` wrote: the file's bytes
     // and their patched copy are not read again, and were held for the
@@ -227,12 +295,19 @@ pub fn run(
         }
     }
     // The output size and render scale (VICTORY_OUTPUT, VICTORY_RENDER_SCALE,
-    // VICTORY_UPSCALER; each off without it).
+    // VICTORY_UPSCALER; each off without it). When an explicit PC upscaler
+    // profile (DLSS / FSR) is active alongside VICTORY_OUTPUT or Series S,
+    // patch only the output target size so its renderer/scale hooks stay intact.
     #[cfg(windows)]
-    if execute && fsr.is_none() {
+    if execute {
         let size = image.info().size_of_image as usize;
-        // SAFETY: the image stays mapped and nothing of it has run yet.
-        unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
+        if let Some([w, h]) = upscaler_output {
+            // SAFETY: the image stays mapped and nothing of it has run yet.
+            unsafe { victory_loader::resolution::apply_output_size(image.base(), size, w, h) };
+        } else if upscaler.is_none() {
+            // SAFETY: the image stays mapped and nothing of it has run yet.
+            unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
+        }
     }
     if !execute {
         println!("not executing (pass --execute to start the title)");
