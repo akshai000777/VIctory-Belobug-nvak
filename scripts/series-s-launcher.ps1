@@ -120,12 +120,27 @@ function Find-GameExe {
 
 function Ensure-Built {
     $victoryExe = Join-Path $RepoRoot 'target\diag\victory.exe'
-    if (Test-Path $victoryExe -PathType Leaf) { return $victoryExe }
+    $needsBuild = -not (Test-Path $victoryExe -PathType Leaf)
+    if (-not $needsBuild) {
+        $exeTime = (Get-Item $victoryExe).LastWriteTimeUtc
+        $newer = Get-ChildItem -Path (Join-Path $RepoRoot 'crates'), (Join-Path $RepoRoot 'apps') -Include *.rs,*.toml,*.hlsl,*.hlsli -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTimeUtc -gt $exeTime } |
+            Select-Object -First 1
+        if ($newer) {
+            $needsBuild = $true
+            Write-Host "[*] Source update detected ($($newer.Name)); rebuilding victory.exe..." -ForegroundColor Cyan
+        }
+    }
+    if (-not $needsBuild) { return $victoryExe }
     if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+        if (Test-Path $victoryExe -PathType Leaf) {
+            Write-Host "[!] 'cargo' not found on PATH; using existing target\diag\victory.exe." -ForegroundColor Yellow
+            return $victoryExe
+        }
         throw "target\diag\victory.exe not found and 'cargo' is not on PATH. Install Rust or run from a shell with cargo."
     }
     Write-Host ''
-    Write-Host '[*] target\diag\victory.exe not found. Building VIctory (diag + diagnostics)...' -ForegroundColor Cyan
+    Write-Host '[*] Building VIctory (diag + diagnostics)...' -ForegroundColor Cyan
     & cargo build --locked --profile diag -p victory --features diagnostics
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path $victoryExe -PathType Leaf)) {
         throw "cargo build failed with exit code $LASTEXITCODE"
