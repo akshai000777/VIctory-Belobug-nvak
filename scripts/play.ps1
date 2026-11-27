@@ -1,6 +1,10 @@
 # Starts the title with the settings this fork is played with (README.md, "How to run it").
 #   scripts\play.ps1 -Exe <path of your own copy's executable>
 # -Console          series-x (default) or series-s (lighter 1080p / 7.6 GiB console profile)
+# -SeriesSReplica   Xbox Series S replica preset for 6 GB RTX 3050 laptops (series-s + LowSpec + NVIDIA adapter + KBM GTA)
+# -Adapter          D3D12 adapter name or DXGI index (for hybrid/MUX laptops, e.g. -Adapter NVIDIA)
+# -KbmGta           GTA V PC-style keyboard & mouse bindings on the stand-in pad (F2 or ` toggles mouse look)
+# -Fps              Frame pace target: 30 (default title pace), 60 (16.667 ms), or uncapped (0)
 # -Safe             without the newer, faster ways (the first thing to try when something is wrong)
 # -RayTracing       the title's own ray-traced indirect light: lit interiors, about a third slower
 # -Fsr4K            PC FidelityFX at 3840x2160 (quality, balanced or performance): FSR 4.1.2 where AMD's SDK offers it for the card, FSR 3.1 otherwise
@@ -17,6 +21,10 @@
 param(
     [Parameter(Mandatory)][string]$Exe,
     [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x',
+    [switch]$SeriesSReplica,
+    [string]$Adapter,
+    [switch]$KbmGta,
+    [ValidateSet('30', '60', 'uncapped')][string]$Fps,
     [switch]$Safe,
     [switch]$RayTracing,
     [ValidateSet('quality', 'balanced', 'performance')][string]$Fsr4K,
@@ -29,6 +37,12 @@ param(
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{}
 )
+if ($SeriesSReplica) {
+    $Console = 'series-s'
+    $LowSpec = $true
+    $KbmGta = $true
+    if (-not $Adapter) { $Adapter = 'NVIDIA' }
+}
 $settings = @{
     VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
     VICTORY_JOIN_COPIES = '1'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_RELAY_COPY = '1'; VICTORY_CARD_STEPS = '2'
@@ -51,6 +65,10 @@ if ($LowSpec) {
     if (-not $Output -and -not $Fsr4K) { $settings.VICTORY_OUTPUT = '1920x1080' }
 }
 if ($Output) { $settings.VICTORY_OUTPUT = $Output }
+if ($Adapter) { $settings.VICTORY_D3D12_ADAPTER = $Adapter }
+if ($KbmGta) { $settings.VICTORY_KBM_GTA = '1' }
+if ($Fps -eq '60') { $settings.VICTORY_FRAME_INTERVAL_MS = '16.667' }
+elseif ($Fps -eq 'uncapped') { $settings.VICTORY_FRAME_INTERVAL_MS = '0' }
 if ($Borderless -or $LosslessScaling) { $settings.VICTORY_WINDOW_MODE = 'borderless' }
 if ($LosslessScaling) {
     $settings.VICTORY_ALLOW_TEARING = '1'
@@ -78,3 +96,4 @@ if ($discarded) {
 $Exe = (Resolve-Path $Exe).Path
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
 try { & $victory run $Exe --execute --console $Console } finally { Pop-Location }
+exit $LASTEXITCODE

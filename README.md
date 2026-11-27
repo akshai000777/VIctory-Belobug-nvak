@@ -70,7 +70,7 @@ describe which lighting paths run and the remaining rendering issues.
 | `VICTORY_OUTPUT=1920x1080` | The title renders to that output size itself (Series X profile; about 16 ms less card time) |
 | `VICTORY_FRAME_INTERVAL_MS=16.667` | Lets the title go above 30 fps (menus and videos reach 60; the game's clock stays right); uses sub-ms spin pacing (`VICTORY_PACE_SPIN=0` disables) |
 | `VICTORY_WINDOW_MODE=borderless` | Sizes top-level windows cleanly to the primary monitor without borders or title bars (`windowed`, `borderless`, `fullscreen`); ideal for Lossless Scaling |
-| `VICTORY_ALLOW_TEARING` / `VICTORY_VSYNC` | Enables DXGI `ALLOW_TEARING` on a triple-buffered flip-discard swap chain (`=0` disables tearing; `VICTORY_VSYNC=1` locks to vblank) |
+| `VICTORY_ALLOW_TEARING` / `VICTORY_VSYNC` | `VICTORY_ALLOW_TEARING=1` enables DXGI `ALLOW_TEARING` on a triple-buffered flip-discard swap chain (`-LosslessScaling` sets it with borderless mode; `VICTORY_VSYNC=1` locks to vblank) |
 | `VICTORY_DLSS` / `VICTORY_DLSS_PRESET` | Native NVIDIA DLSS Super Resolution (`dlaa`, `quality`, `balanced`, `performance`, `ultra_performance`) at any `-Output` resolution; `VICTORY_DLSS_PRESET` picks `J`, `K`, `L`, `M`, or `default` |
 | `VICTORY_FSR` / `VICTORY_FSR_4K` | AMD PC FidelityFX 4.1.2 / 3.1 upscaling across any `VICTORY_OUTPUT` mode (`VICTORY_FSR=quality`) or fixed 4K (`VICTORY_FSR_4K`) |
 | `VICTORY_AMBIENT_SETTLE` | How fast light settles after walking indoors (on by default, `250,3`; `0` turns it off) |
@@ -142,8 +142,10 @@ On a hybrid-graphics PC, the runtime and offline pipeline checks prefer a
 high-performance adapter with Shader Model 6.6. The runtime logs its adapter
 name, PCI vendor and device IDs, and dedicated VRAM. Set
 `VICTORY_D3D12_ADAPTER` to a zero-based DXGI index or part of the adapter's
-name to select it explicitly. With the launcher, pass
-`-More @{VICTORY_D3D12_ADAPTER='NVIDIA'}`.
+name to select it explicitly. With the launcher, pass `-Adapter NVIDIA`
+(or `-SeriesSReplica` for the 6 GB RTX 3050 Xbox Series S replica preset, or
+double-click `Play-SeriesS-RTX3050.cmd` in File Explorer to auto-locate /
+browse to your executable and pre-translate shaders).
 
 Before the first run, ahead of time (both can be stopped and go on later):
 

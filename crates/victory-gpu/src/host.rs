@@ -9249,7 +9249,7 @@ const BUFFERS: u32 = 3;
 
 fn allow_tearing_asked() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_ALLOW_TEARING").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ALLOW_TEARING").is_some_and(|v| v == "1"))
 }
 
 fn vsync_asked() -> bool {
@@ -10648,19 +10648,49 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
         let mut rect = RECT {
             left: 0,
             top: 0,
-            right: width as i32,
-            bottom: height as i32,
+            right: width.min(i32::MAX as u32) as i32,
+            bottom: height.min(i32::MAX as u32) as i32,
         };
         AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
+        let (mut win_x, mut win_y) = (CW_USEDEFAULT, CW_USEDEFAULT);
+        let (mut win_w, mut win_h) = (rect.right - rect.left, rect.bottom - rect.top);
+        let mut area = RECT::default();
+        if windows_sys::Win32::UI::WindowsAndMessaging::SystemParametersInfoW(
+            windows_sys::Win32::UI::WindowsAndMessaging::SPI_GETWORKAREA,
+            0,
+            (&raw mut area).cast(),
+            0,
+        ) != 0
+        {
+            let (aw, ah) = (area.right - area.left, area.bottom - area.top);
+            let mut pad = RECT::default();
+            AdjustWindowRect(&mut pad, WS_OVERLAPPEDWINDOW, false)?;
+            let pad_w = pad.right - pad.left;
+            let pad_h = pad.bottom - pad.top;
+            let cw = rect.right - rect.left - pad_w;
+            let ch = rect.bottom - rect.top - pad_h;
+            if aw > pad_w && ah > pad_h && (win_w > aw || win_h > ah) && cw > 0 && ch > 0 {
+                let scale = f64::min(
+                    f64::from(aw - pad_w) / f64::from(cw),
+                    f64::from(ah - pad_h) / f64::from(ch),
+                );
+                win_w = ((f64::from(cw) * scale) as i32 + pad_w).min(aw);
+                win_h = ((f64::from(ch) * scale) as i32 + pad_h).min(ah);
+            }
+            if aw > 0 && ah > 0 && win_w <= aw && win_h <= ah {
+                win_x = area.left + (aw - win_w) / 2;
+                win_y = area.top + (ah - win_h) / 2;
+            }
+        }
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             CLASS,
             w!("VIctory"),
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            rect.right - rect.left,
-            rect.bottom - rect.top,
+            win_x,
+            win_y,
+            win_w,
+            win_h,
             None,
             None,
             Some(instance.into()),
