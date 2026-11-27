@@ -1295,6 +1295,25 @@ fn video_memory_percent() -> u64 {
     pct
 }
 
+/// Dynamic per-side cap on streamed placed 2D textures when
+/// `VICTORY_TEXTURE_MAX` is not explicitly set.
+#[cfg(windows)]
+fn dynamic_texture_max(low_vram: bool, pct: u64) -> u64 {
+    if low_vram {
+        match pct {
+            0..70 => 1024,
+            70..85 => 512,
+            _ => 256,
+        }
+    } else {
+        match pct {
+            0..92 => 1024,
+            92..97 => 512,
+            _ => 256,
+        }
+    }
+}
+
 /// How many of a streamed placed 2D texture's largest mips to skip so no side
 /// passes `VICTORY_TEXTURE_MAX` (0: uncapped; unset: scales with VRAM budget
 /// and current usage to prevent VRAM spillover into system RAM).
@@ -1314,21 +1333,7 @@ fn over_cap(desc: &ResourceDesc) -> u32 {
     let low_vram = crate::host::host()
         .and_then(|h| h.video_memory())
         .is_some_and(|[b, ..]| b <= SIX_GIB);
-    let max = set.unwrap_or_else(|| {
-        if low_vram {
-            match pct {
-                0..80 => 1024,
-                80..90 => 512,
-                _ => 256,
-            }
-        } else {
-            match pct {
-                0..92 => 1024,
-                92..97 => 512,
-                _ => 256,
-            }
-        }
-    });
+    let max = set.unwrap_or_else(|| dynamic_texture_max(low_vram, pct));
     let mut skip = 0u32;
     while (desc.width >> skip) > max || (u64::from(desc.height) >> skip) > max {
         if skip + 1 >= u32::from(desc.mip_levels) {
@@ -1816,6 +1821,18 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     }
 }
 
+#[cfg(windows)]
+fn targets_room_cap(budget: Option<u64>) -> u64 {
+    const GIB: u64 = 1 << 30;
+    const MIB: u64 = 1 << 20;
+    match budget {
+        Some(b) if b <= 7 * GIB => (b * 27 / 100).clamp(896 * MIB, 1408 * MIB),
+        Some(b) if b <= 9 * GIB => (b * 35 / 100).clamp(1024 * MIB, 1792 * MIB),
+        Some(b) if b < 16 * GIB => 2048 * MIB,
+        _ => 3072 * MIB,
+    }
+}
+
 /// The bytes of the card's memory the texture queue leaves free for
 /// render targets and other host copies the host itself writes that are
 /// not made yet: `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (3,072; 0: none, as
@@ -1844,16 +1861,11 @@ pub(crate) fn targets_room_kept() -> u64 {
         {
             return mb.min(8192) << 20;
         }
-        const GIB: u64 = 1 << 30;
-        const MIB: u64 = 1 << 20;
-        match crate::host::host()
-            .and_then(|h| h.video_memory())
-            .map(|[b, ..]| b)
-        {
-            Some(b) if b <= 9 * GIB => (b * 35 / 100).clamp(1024 * MIB, 1792 * MIB),
-            Some(b) if b < 16 * GIB => 2048 * MIB,
-            _ => 3072 * MIB,
-        }
+        targets_room_cap(
+            crate::host::host()
+                .and_then(|h| h.video_memory())
+                .map(|[b, ..]| b),
+        )
     });
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
@@ -4736,6 +4748,23 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(texture_floor_bytes(Some(12 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(24 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(32 * GIB)), 2 * GIB);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn low_vram_target_room_and_texture_stepdown_avoid_deadlock() {
+        const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
+        let budget_6gb = 5233 * MIB;
+        assert_eq!(targets_room_cap(Some(budget_6gb)), 1408 * MIB);
+        assert_eq!(targets_room_cap(Some(8 * GIB)), 1792 * MIB);
+        assert_eq!(targets_room_cap(Some(12 * GIB)), 2048 * MIB);
+        assert_eq!(targets_room_cap(None), 3072 * MIB);
+
+        assert_eq!(dynamic_texture_max(true, 69), 1024);
+        assert_eq!(dynamic_texture_max(true, 70), 512);
+        assert_eq!(dynamic_texture_max(true, 85), 256);
+        assert_eq!(dynamic_texture_max(false, 90), 1024);
     }
 
     /// A placed texture viewed from a later level has a host copy of that

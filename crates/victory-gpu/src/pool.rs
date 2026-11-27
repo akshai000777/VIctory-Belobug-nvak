@@ -43,7 +43,7 @@ fn spare_cap_for_vram(vram_budget: Option<u64>) -> usize {
     const GIB: u64 = 1 << 30;
     match vram_budget {
         None => 8,
-        Some(b) if b <= 6 * GIB => 4,
+        Some(b) if b <= 6 * GIB => 2,
         Some(b) if b <= 8 * GIB => 8,
         Some(b) if b <= 12 * GIB => 16,
         Some(b) if b <= 16 * GIB => 24,
@@ -145,7 +145,7 @@ fn ahead() -> usize {
             .and_then(|h| h.video_memory())
             .map(|[b, ..]| b);
         match budget {
-            Some(b) if b <= 6 * GIB => 3,
+            Some(b) if b <= 6 * GIB => 2,
             Some(b) if b <= 8 * GIB => 4,
             Some(b) if b <= 12 * GIB => 6,
             _ => 12,

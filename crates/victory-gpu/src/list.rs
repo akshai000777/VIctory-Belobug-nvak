@@ -252,7 +252,7 @@ fn idle_most() -> (usize, u64) {
         }
         const GIB: u64 = 1 << 30;
         let count = match crate::residency::total_physical_ram() {
-            Some(total) if total <= 16 * GIB => 32,
+            Some(total) if total <= 16 * GIB => 48,
             Some(total) if total <= 32 * GIB => 64,
             _ => 192,
         };

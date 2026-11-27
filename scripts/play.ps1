@@ -59,7 +59,6 @@ if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 if ($LowSpec) {
     $settings.VICTORY_RESIDENCY = '1'
     $settings.VICTORY_RESIDENCY_LIMITED = '1'
-    $settings.VICTORY_TEXTURE_MAX = '1024'
     $settings.VICTORY_WINDOW_BUDGET_MB = '1024'
     if (-not $Output -and -not $Fsr4K) { $settings.VICTORY_OUTPUT = '1920x1080' }
 }

@@ -537,6 +537,10 @@ struct Queue {
     slow: VecDeque<Arc<Pending>>,
     slow_now: usize,
     requested: VecDeque<Arc<Pending>>,
+    /// Requested pipelines known to take long: popped only once fast requested
+    /// pipelines have been claimed so multi-second compiles do not stall fast
+    /// world draws queued behind them.
+    requested_slow: VecDeque<Arc<Pending>>,
 }
 
 impl Queue {
@@ -547,6 +551,7 @@ impl Queue {
             slow: VecDeque::new(),
             slow_now: 0,
             requested: VecDeque::new(),
+            requested_slow: VecDeque::new(),
         }
     }
 
@@ -564,6 +569,8 @@ impl Queue {
         p.queue_state.store(priority, Ordering::Relaxed);
         if priority == REQUESTED && p.screen && screens_first() {
             self.screen.push_back(p.clone());
+        } else if priority == REQUESTED && slow {
+            self.requested_slow.push_back(p.clone());
         } else if priority == REQUESTED {
             self.requested.push_back(p.clone());
         } else if slow {
@@ -581,7 +588,11 @@ impl Queue {
         };
         let mut p = self.screen.pop_front();
         if p.is_none() && !screens_only {
-            p = self.requested.pop_front().or_else(|| unclaimed(&mut self.early));
+            p = self
+                .requested
+                .pop_front()
+                .or_else(|| self.requested_slow.pop_front())
+                .or_else(|| unclaimed(&mut self.early));
             if p.is_none() && self.slow_now < slow_limit {
                 p = unclaimed(&mut self.slow);
                 if let Some(p) = &p {
@@ -660,8 +671,8 @@ fn workers() -> bool {
         if asked.is_none() && crate::residency::limited_host_ram() {
             const GIB: u64 = 1 << 30;
             let cap = match crate::residency::total_physical_ram() {
-                Some(total) if total <= 16 * GIB => 4,
-                _ => 6,
+                Some(total) if total <= 16 * GIB => 6,
+                _ => 8,
             };
             workers = workers.min(cap);
         }
@@ -685,14 +696,21 @@ fn spawn_worker(screens_only: bool) -> bool {
         .name(format!("victory-pipelines-{slot}"))
         .spawn(move || {
             WORKER_SLOT.set(slot);
-            // Below the title's own threads (loading, recording),
-            // and the streaming one, which is below normal itself
-            // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
-            let lowest = !screens_only && std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
+            // Below the title's own normal/submit threads, while staying level
+            // with streaming/thin workers so world pipelines are not starved
+            // during active rendering (`VICTORY_PIPELINE_LOWEST=1`: lowest).
+            let lowest =
+                !screens_only && std::env::var_os("VICTORY_PIPELINE_LOWEST").is_some_and(|v| v == "1");
             // SAFETY: a plain call on our own thread.
             unsafe {
                 use windows::Win32::System::Threading::*;
-                let priority = if lowest { THREAD_PRIORITY_LOWEST } else { THREAD_PRIORITY_BELOW_NORMAL };
+                let priority = if screens_only {
+                    THREAD_PRIORITY_NORMAL
+                } else if lowest {
+                    THREAD_PRIORITY_LOWEST
+                } else {
+                    THREAD_PRIORITY_BELOW_NORMAL
+                };
                 let _ = SetThreadPriority(GetCurrentThread(), priority);
             }
             loop {
@@ -853,5 +871,18 @@ mod tests {
         assert!(Arc::ptr_eq(&queue.pop(true, 1).unwrap(), &screen));
         assert!(queue.pop(true, 1).is_none());
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &world));
+    }
+
+    #[test]
+    fn requested_fast_pipelines_precede_requested_slow_pipelines() {
+        let new = || Arc::new(Pending::new(Vec::new(), None));
+        let (slow_req, fast_req) = (new(), new());
+        let mut queue = Queue::new();
+        assert_eq!(queue.push_as(&slow_req, REQUESTED, true), Some(true));
+        assert_eq!(queue.push_as(&fast_req, REQUESTED, false), Some(true));
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &fast_req));
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &slow_req));
+        assert!(!slow_req.was_slow.load(Ordering::Relaxed));
+        assert!(queue.pop(false, 1).is_none());
     }
 }
