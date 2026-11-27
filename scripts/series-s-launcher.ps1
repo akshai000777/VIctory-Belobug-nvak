@@ -1,7 +1,9 @@
 # Double-click launcher backend for Play-SeriesS-RTX3050.cmd.
-# Locates game_scarlett_master.exe (via victory.toml, common folders, or a
-# File Explorer picker), checks the shader cache, builds if needed, and
-# launches VIctory in steady Xbox Series S Replica mode for RTX 3050 laptops.
+# Flow:
+#   1. Open File Explorer to pick game_scarlett_master.exe (and save victory.toml)
+#   2. Compile target\diag\victory.exe with cargo before launching anything
+#   3. Pre-translate shaders once for RTX 3050 if not yet done for that game folder
+#   4. Launch Xbox Series S Replica (1080p, LowSpec, NVIDIA adapter, KBM + Pad)
 param(
     [string]$Exe
 )
@@ -13,6 +15,7 @@ Set-Location $RepoRoot
 $TomlPath = Join-Path $RepoRoot 'victory.toml'
 $LogDir = Join-Path $env:LOCALAPPDATA 'victory\logs'
 $LogFile = Join-Path $LogDir 'series-s-last.log'
+$ShaderMarker = Join-Path $LogDir 'shaders-done.txt'
 New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 
 function Get-TomlPathSetting {
@@ -64,111 +67,103 @@ function Save-GameDirToml {
     [System.IO.File]::WriteAllText($TomlPath, (($lines -join "`r`n") + "`r`n"), $utf8NoBom)
 }
 
+function Get-InitialBrowseDir {
+    $cfgDir = Get-TomlPathSetting -Key 'game_dir' -DefaultValue ''
+    if ($cfgDir -and (Test-Path $cfgDir -PathType Container)) { return $cfgDir }
+    foreach ($p in @('C:\VIctory\Games\YourGame\GTA6', 'C:\VIctory\Games')) {
+        if (Test-Path $p -PathType Container) { return $p }
+    }
+    return 'C:\'
+}
+
 function Select-GameExeDialog {
     param([string]$StartDir)
     Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
     [System.Windows.Forms.Application]::EnableVisualStyles()
+
     $dlg = New-Object System.Windows.Forms.OpenFileDialog
-    $dlg.Title = 'Select Xbox Series game executable (game_scarlett_master.exe)'
+    $dlg.Title = 'Step 1: Select game_scarlett_master.exe to compile & run'
     $dlg.Filter = 'Title Executable (game_scarlett_master.exe)|game_scarlett_master.exe|Executables (*.exe)|*.exe'
-    if ($StartDir -and (Test-Path $StartDir)) {
+    if ($StartDir -and (Test-Path $StartDir -PathType Container)) {
         $dlg.InitialDirectory = $StartDir
-    } elseif (Test-Path 'C:\VIctory\Games') {
-        $dlg.InitialDirectory = 'C:\VIctory\Games'
-    } else {
-        $dlg.InitialDirectory = 'C:\'
+        if (Test-Path (Join-Path $StartDir 'game_scarlett_master.exe') -PathType Leaf) {
+            $dlg.FileName = 'game_scarlett_master.exe'
+        }
     }
+
     $owner = New-Object System.Windows.Forms.Form
-    $owner.TopMost = $true
-    $owner.StartPosition = 'CenterScreen'
+    $owner.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
+    $owner.Size = New-Object System.Drawing.Size(1, 1)
+    $owner.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
     $owner.ShowInTaskbar = $false
+    $owner.Opacity = 0
+    $owner.TopMost = $true
     try {
+        $owner.Show()
+        $owner.Activate()
         $res = $dlg.ShowDialog($owner)
-        if ($res -eq [System.Windows.Forms.DialogResult]::OK -and (Test-Path $dlg.FileName)) {
-            return $dlg.FileName
+        if ($res -eq [System.Windows.Forms.DialogResult]::OK -and (Test-Path $dlg.FileName -PathType Leaf)) {
+            return (Resolve-Path $dlg.FileName).Path
         }
         return $null
     } finally {
         $dlg.Dispose()
+        $owner.Close()
         $owner.Dispose()
     }
 }
 
-function Find-GameExe {
-    param([string]$Hint)
-    if ($Hint -and (Test-Path $Hint -PathType Leaf)) {
-        return (Resolve-Path $Hint).Path
-    }
-    $cfgDir = Get-TomlPathSetting -Key 'game_dir' -DefaultValue ''
-    if ($cfgDir) {
-        $candidate = Join-Path $cfgDir 'game_scarlett_master.exe'
-        if (Test-Path $candidate -PathType Leaf) { return (Resolve-Path $candidate).Path }
-    }
-    $known = @(
-        'C:\VIctory\Games\YourGame\GTA6\game_scarlett_master.exe',
-        'C:\VIctory\Games\GTA6\game_scarlett_master.exe'
-    )
-    foreach ($p in $known) {
-        if (Test-Path $p -PathType Leaf) { return (Resolve-Path $p).Path }
-    }
-    if (Test-Path 'C:\VIctory\Games') {
-        $found = Get-ChildItem -Path 'C:\VIctory\Games' -Filter 'game_scarlett_master.exe' -File -Recurse -Depth 3 -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($found) { return $found.FullName }
-    }
-    return $null
-}
-
-function Ensure-Built {
+function Invoke-CompileVictory {
+    Write-Host ''
+    Write-Host '[Step 2/4] Compiling VIctory (cargo build --locked --profile diag)...' -ForegroundColor Cyan
     $victoryExe = Join-Path $RepoRoot 'target\diag\victory.exe'
-    $needsBuild = -not (Test-Path $victoryExe -PathType Leaf)
-    if (-not $needsBuild) {
-        $exeTime = (Get-Item $victoryExe).LastWriteTimeUtc
-        $newer = Get-ChildItem -Path (Join-Path $RepoRoot 'crates'), (Join-Path $RepoRoot 'apps') -Include *.rs,*.toml,*.hlsl,*.hlsli -Recurse -File -ErrorAction SilentlyContinue |
-            Where-Object { $_.LastWriteTimeUtc -gt $exeTime } |
-            Select-Object -First 1
-        if ($newer) {
-            $needsBuild = $true
-            Write-Host "[*] Source update detected ($($newer.Name)); rebuilding victory.exe..." -ForegroundColor Cyan
-        }
-    }
-    if (-not $needsBuild) { return $victoryExe }
     if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
         if (Test-Path $victoryExe -PathType Leaf) {
             Write-Host "[!] 'cargo' not found on PATH; using existing target\diag\victory.exe." -ForegroundColor Yellow
             return $victoryExe
         }
-        throw "target\diag\victory.exe not found and 'cargo' is not on PATH. Install Rust or run from a shell with cargo."
+        Write-Host "[!] 'cargo' was not found on PATH. Install Rust or run from a shell with cargo." -ForegroundColor Red
+        exit 1
     }
-    Write-Host ''
-    Write-Host '[*] Building VIctory (diag + diagnostics)...' -ForegroundColor Cyan
     & cargo build --locked --profile diag -p victory --features diagnostics
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path $victoryExe -PathType Leaf)) {
-        throw "cargo build failed with exit code $LASTEXITCODE"
+        Write-Host "[!] cargo build failed with exit code $LASTEXITCODE." -ForegroundColor Red
+        exit $LASTEXITCODE
     }
     return $victoryExe
 }
 
-function Get-ShaderCacheCount {
-    $cacheRoot = Get-TomlPathSetting -Key 'cache_dir' -DefaultValue (Join-Path $env:LOCALAPPDATA 'victory\cache')
-    $shaderDir = Join-Path $cacheRoot 'shaders'
-    if (-not (Test-Path $shaderDir)) { return 0 }
-    return @(Get-ChildItem -Path $shaderDir -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 501).Count
+function Test-ShadersDone {
+    param([string]$GameDir)
+    if (-not (Test-Path $ShaderMarker -PathType Leaf)) { return $false }
+    $norm = $GameDir.TrimEnd('\').ToLowerInvariant()
+    foreach ($line in (Get-Content $ShaderMarker -Encoding UTF8 -ErrorAction SilentlyContinue)) {
+        if ($line.Trim().TrimEnd('\').ToLowerInvariant() -eq $norm) { return $true }
+    }
+    return $false
+}
+
+function Mark-ShadersDone {
+    param([string]$GameDir)
+    if (-not (Test-ShadersDone -GameDir $GameDir)) {
+        Add-Content -Path $ShaderMarker -Value $GameDir -Encoding UTF8
+    }
 }
 
 function Invoke-ShaderPrecompile {
     param([string]$VictoryExe, [string]$GameDir)
     Write-Host ''
-    Write-Host '======================================================================' -ForegroundColor Cyan
-    Write-Host '  Pre-translating ALL shaders for NVIDIA RTX 3050 (one-time setup)' -ForegroundColor Cyan
-    Write-Host '  This avoids frozen/unresponsive UI and first-run shader stalls.' -ForegroundColor Cyan
-    Write-Host '  Takes a few minutes once; safe to close and resume later.' -ForegroundColor Cyan
-    Write-Host '======================================================================' -ForegroundColor Cyan
+    Write-Host '[Step 3/4] Pre-translating shaders for NVIDIA RTX 3050 (one-time per game)...' -ForegroundColor Cyan
+    Write-Host '          This prevents audio-only / frozen UI stalls on boot.' -ForegroundColor Gray
     $prevAdapter = $env:VICTORY_D3D12_ADAPTER
     $env:VICTORY_D3D12_ADAPTER = 'NVIDIA'
     try {
         & $VictoryExe shaders $GameDir 2>&1 | Tee-Object -FilePath $LogFile
-        if ($LASTEXITCODE -ne 0) {
-            Write-Host "[!] Shader precompile exited with code $LASTEXITCODE" -ForegroundColor Yellow
+        if ($LASTEXITCODE -eq 0) {
+            Mark-ShadersDone -GameDir $GameDir
+        } else {
+            Write-Host "[!] Shader precompile exited with code $LASTEXITCODE (continuing to launch)." -ForegroundColor Yellow
         }
     } finally {
         if ($null -eq $prevAdapter) { Remove-Item Env:VICTORY_D3D12_ADAPTER -ErrorAction SilentlyContinue }
@@ -176,108 +171,48 @@ function Invoke-ShaderPrecompile {
     }
 }
 
-function Show-ControlsHelp {
-    Write-Host ''
-    Write-Host '----------------------------------------------------------------------' -ForegroundColor DarkGray
-    Write-Host '  IMPORTANT FOR MENU / UI NAVIGATION:' -ForegroundColor Yellow
-    Write-Host '  1) Click ONCE inside the VIctory game window so it has focus.' -ForegroundColor White
-    Write-Host '  2) Mouse clicks do NOT click Xbox console menus! Use keyboard/pad:' -ForegroundColor White
-    Write-Host '       Arrow Keys / WASD = Move     Enter = A (Select/Confirm)' -ForegroundColor Green
-    Write-Host '       Backspace = B (Back)         Esc / P = Menu / Pause' -ForegroundColor Green
-    Write-Host '       F2 or ` (~) = Toggle Mouse-Look once inside the 3D world' -ForegroundColor Green
-    Write-Host '       F3 = Toggle FPS / VRAM / RAM overlay panel' -ForegroundColor Green
-    Write-Host "  Log saved to: $LogFile" -ForegroundColor Gray
-    Write-Host '----------------------------------------------------------------------' -ForegroundColor DarkGray
-    Write-Host ''
-}
-
-$resolvedExe = Find-GameExe -Hint $Exe
-if (-not $resolvedExe) {
-    Write-Host '[*] Could not auto-locate game_scarlett_master.exe. Opening File Explorer...' -ForegroundColor Cyan
-    $picked = Select-GameExeDialog -StartDir 'C:\VIctory\Games'
-    if (-not $picked) {
-        Write-Host '[!] No executable selected. Exiting.' -ForegroundColor Yellow
-        exit 1
-    }
-    $resolvedExe = $picked
-    Save-GameDirToml -GameDir (Split-Path $resolvedExe -Parent)
-    Write-Host "[+] Saved game_dir to victory.toml: $(Split-Path $resolvedExe -Parent)" -ForegroundColor Green
-} else {
-    $gameDir = Split-Path $resolvedExe -Parent
-    if (-not (Get-TomlPathSetting -Key 'game_dir' -DefaultValue '')) {
-        Save-GameDirToml -GameDir $gameDir
-    }
-}
-
-$cachedShaders = Get-ShaderCacheCount
-$dataDir = Get-TomlPathSetting -Key 'data_dir' -DefaultValue (Join-Path $env:LOCALAPPDATA 'victory\data')
-
-Write-Host ''
 Write-Host '======================================================================' -ForegroundColor Cyan
 Write-Host '  VIctory - Xbox Series S Replica (RTX 3050 Laptop / LOQ 15IAX9)' -ForegroundColor Cyan
 Write-Host '======================================================================' -ForegroundColor Cyan
-Write-Host "  Executable  : $resolvedExe"
-Write-Host "  ShaderCache : $cachedShaders+ cached shaders"
-Write-Host "  Runtime Log : $LogFile"
-Write-Host "  Crash Logs  : $dataDir\<TitleID>\crashes.log"
-Write-Host ''
-Write-Host '  [1] Play Xbox Series S Replica (1080p, LowSpec, RTX 3050, KBM+Pad)'
-Write-Host '  [2] Play Safe Mode Series S    (use if troubleshooting black screen/crash)'
-Write-Host '  [3] Pre-translate ALL shaders  (run once first so UI/world do not freeze!)'
-Write-Host '  [4] Browse File Explorer to pick a different .exe'
-Write-Host '  [5] Open logs & cache folder in File Explorer'
-Write-Host ''
 
-$choice = (Read-Host 'Choose [1-5] (press Enter for 1)').Trim()
-if ([string]::IsNullOrEmpty($choice)) { $choice = '1' }
-
-switch ($choice) {
-    '4' {
-        $picked = Select-GameExeDialog -StartDir (Split-Path $resolvedExe -Parent)
-        if ($picked) {
-            $resolvedExe = $picked
-            Save-GameDirToml -GameDir (Split-Path $resolvedExe -Parent)
-            Write-Host "[+] Selected and saved: $resolvedExe" -ForegroundColor Green
-        } else {
-            Write-Host '[!] Selection cancelled.' -ForegroundColor Yellow
-            exit 0
-        }
-        $choice = '1'
-    }
-    '5' {
-        $victoryAppData = Join-Path $env:LOCALAPPDATA 'victory'
-        New-Item -ItemType Directory -Path $victoryAppData -Force | Out-Null
-        Start-Process explorer.exe $victoryAppData
+$resolvedExe = $null
+if ($Exe -and (Test-Path $Exe -PathType Leaf)) {
+    $resolvedExe = (Resolve-Path $Exe).Path
+} else {
+    Write-Host '[Step 1/4] Opening File Explorer to pick game_scarlett_master.exe...' -ForegroundColor Cyan
+    $resolvedExe = Select-GameExeDialog -StartDir (Get-InitialBrowseDir)
+    if (-not $resolvedExe) {
+        Write-Host '[!] No .exe selected. Cancelled.' -ForegroundColor Yellow
         exit 0
     }
 }
 
-$victoryExe = Ensure-Built
 $gameDir = Split-Path $resolvedExe -Parent
+Save-GameDirToml -GameDir $gameDir
+Write-Host "  Selected EXE : $resolvedExe" -ForegroundColor Green
+Write-Host "  Saved config : $TomlPath" -ForegroundColor Gray
 
-if ($choice -eq '3') {
-    Invoke-ShaderPrecompile -VictoryExe $victoryExe -GameDir $gameDir
-    $ans = (Read-Host 'Shader pre-translation finished. Launch Series S Replica now? [Y/n]').Trim()
-    if ($ans -and $ans -notmatch '^[Yy]') { exit 0 }
-    $choice = '1'
-} elseif ($cachedShaders -lt 500) {
+$victoryExe = Invoke-CompileVictory
+
+if (Test-ShadersDone -GameDir $gameDir) {
     Write-Host ''
-    Write-Host "[!] Shader cache only has $cachedShaders entries." -ForegroundColor Yellow
-    Write-Host '    Without pre-translating shaders first, the initial UI/boot compiles live' -ForegroundColor Yellow
-    Write-Host '    and can look frozen (audio plays while video/UI stalls).' -ForegroundColor Yellow
-    $ans = (Read-Host 'Pre-translate shaders now (recommended, one-time)? [Y/n, Enter = Y]').Trim()
-    if ([string]::IsNullOrEmpty($ans) -or $ans -match '^[Yy]') {
-        Invoke-ShaderPrecompile -VictoryExe $victoryExe -GameDir $gameDir
-    }
+    Write-Host '[Step 3/4] Shaders already pre-translated for this folder (skipping).' -ForegroundColor Green
+} else {
+    Invoke-ShaderPrecompile -VictoryExe $victoryExe -GameDir $gameDir
 }
+
+Write-Host ''
+Write-Host '[Step 4/4] Launching Xbox Series S Replica (1080p, LowSpec, RTX 3050)...' -ForegroundColor Cyan
+Write-Host '----------------------------------------------------------------------' -ForegroundColor DarkGray
+Write-Host '  IMPORTANT FOR MENUS / UI:' -ForegroundColor Yellow
+Write-Host '  1) Click ONCE inside the game window so it has focus.' -ForegroundColor White
+Write-Host '  2) Mouse clicks do NOT click Xbox console menus! Use keyboard:' -ForegroundColor White
+Write-Host '       Arrows / WASD = Move     Enter = A (Confirm)   Backspace = B' -ForegroundColor Green
+Write-Host '       Esc / P = Menu / Pause   F2 or ` = 3D Mouse Look   F3 = Stats' -ForegroundColor Green
+Write-Host "  Log file : $LogFile" -ForegroundColor Gray
+Write-Host '----------------------------------------------------------------------' -ForegroundColor DarkGray
+Write-Host ''
 
 $playScript = Join-Path $PSScriptRoot 'play.ps1'
-Show-ControlsHelp
-
-$playArgs = @('-Exe', $resolvedExe, '-SeriesSReplica')
-if ($choice -eq '2') {
-    $playArgs += '-Safe'
-}
-
-& $playScript @playArgs *>&1 | Tee-Object -FilePath $LogFile
+& $playScript -Exe $resolvedExe -SeriesSReplica *>&1 | Tee-Object -FilePath $LogFile
 exit $LASTEXITCODE
